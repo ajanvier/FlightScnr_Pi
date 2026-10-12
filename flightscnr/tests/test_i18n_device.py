@@ -60,6 +60,75 @@ class I18nDeviceTests(unittest.TestCase):
         )
         self.assertTrue(next(item for item in items if item["id"] == "nl")["selected"])
 
+    def test_disclaimer_translations_fit_without_hiding_controls_or_credit(self):
+        import pygame
+        from display.round_touch import draw, theme
+        from display.round_touch.screens import disclaimer
+        from i18n import activate, tr
+
+        load_font = draw.load_font
+        rendered = {}
+
+        class FontRecorder:
+            def __init__(self, font):
+                self.font = font
+
+            def __getattr__(self, name):
+                return getattr(self.font, name)
+
+            def render(self, text, *args):
+                image = self.font.render(text, *args)
+                rendered[id(image)] = (image, text)
+                return image
+
+        class SurfaceRecorder(pygame.Surface):
+            def blit(self, source, dest, *args, **kwargs):
+                rect = super().blit(source, dest, *args, **kwargs)
+                if id(source) in rendered:
+                    # pygame returns clipped bounds; verify the original image
+                    # too so a cut-off translation cannot pass this assertion.
+                    self.assert_unclipped(source, rect)
+                    self.text_rects.append((rendered[id(source)][1], rect))
+                return rect
+
+        with mock.patch.object(draw, "load_font", side_effect=lambda *a, **kw: FontRecorder(load_font(*a, **kw))) as fonts:
+            for language in ("en", "nl", "de", "fr", "es", "hu"):
+                activate(language)
+                for countdown in (None, 8):
+                    with self.subTest(language=language, countdown=countdown):
+                        rendered.clear()
+                        fonts.reset_mock()
+                        surface = SurfaceRecorder((720, 720))
+                        surface.text_rects = []
+                        surface.assert_unclipped = lambda source, rect: self.assertEqual(source.get_size(), rect.size)
+                        disclaimer.draw_disclaimer(surface, countdown_s=countdown)
+                        self.assertEqual(fonts.call_args_list, [
+                            mock.call(theme.s(15), bold=True), mock.call(theme.s(13)),
+                            mock.call(theme.s(13), bold=True), mock.call(theme.s(12)),
+                            mock.call(theme.s(12)), mock.call(theme.s(11)),
+                        ])
+                        rects = dict(surface.text_rects)
+                        texts = [text for text, _ in surface.text_rects]
+                        self.assertIn(tr(disclaimer.REMEMBER_LABEL), texts)
+                        for key in (disclaimer.TITLE, *disclaimer.PARAGRAPHS):
+                            # Wrapping may split a sentence, but must retain all
+                            # its words, accents and punctuation in order.
+                            self.assertIn(tr(key), " ".join(texts))
+                        for text, rect in surface.text_rects:
+                            self.assertTrue(disclaimer.rects_inside_visible_circle(rect), text)
+                        credit = rects[disclaimer.CREDIT]
+                        self.assertLessEqual(credit.bottom, disclaimer.remember_hit_rect().top)
+                        self.assertTrue(disclaimer.rects_inside_visible_circle(
+                            disclaimer.accept_button_rect(), disclaimer.remember_hit_rect(),
+                            disclaimer.countdown_text_rect(),
+                        ))
+                        if countdown is None:
+                            self.assertIsNotNone(disclaimer.accept_button_rect())
+                            self.assertIn(tr(disclaimer.ACCEPT_LABEL), texts)
+                        else:
+                            self.assertIsNone(disclaimer.accept_button_rect())
+                            self.assertIn(tr("disclaimer.countdown", seconds=8), rects)
+
     def test_atc_and_basemap_labels_follow_language_switch(self):
         from display.round_touch import settings
         from display.round_touch.screens import info
@@ -70,7 +139,6 @@ class I18nDeviceTests(unittest.TestCase):
             self.assertEqual(settings.map_style_option_label("dark"), tr("portal.radar.map_style.dark_carto"))
             self.assertEqual(info._atc_status_label_from_status({"state": "Playing"}),
                              tr("settings.atc.status", value=tr("portal.atc.state.playing")))
-
 
     def test_language_picker_selects_effective_pack_for_regional_tag(self):
         from display.round_touch import settings
