@@ -425,6 +425,7 @@ class TestAtcLabelFreeze:
         calls = []
         monkeypatch.setattr(atc_audio, "status", lambda: calls.append(1) or {})
         info._atc_rows_cache = (_t.monotonic() - 60.0, ("stale", "rows"))
+        monkeypatch.setattr(info, "_atc_rows_key", None)
         info.hold_atc_labels(5.0)
         assert info._atc_row_labels() == ["stale", "rows"]
         assert not calls  # no bluetoothctl / IPC rebuild during the hold

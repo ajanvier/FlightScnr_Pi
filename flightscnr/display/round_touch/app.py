@@ -40,6 +40,7 @@ from display.round_touch import (
     input_handler,
     long_press_pan,
     map_bg,
+    motion,
     nav,
     pinch_handler,
     position_smooth,
@@ -133,6 +134,19 @@ class RoundTouchDisplay:
     _power_menu_open = False
     _power_confirm: str | None = None
     _manual_screen_off = False
+    _startup_pending = False
+    _startup_accepted = False
+    _startup_error = False
+    _startup_result = None
+    _session_services_started = False
+    _defer_draws = False
+    _draw_pending = False
+    _ring_draw_pending = False
+    _transition = None
+    _capture_transition = False
+    _frame_identity = None
+    _audio_tick_thread = None
+    _audio_tick_at = 0.0
 
     def __init__(self):
         from utilities import system_control
@@ -174,6 +188,9 @@ class RoundTouchDisplay:
         self.overhead = Overhead()
         # Defer FR24/AIS/ATC until the boot disclaimer is accepted.
         self._session_unlocked = False
+        self._pacer = motion.FramePacer()
+        self._follow_smoother = position_smooth.PositionSmoother(max_extrapolate_s=2.0, stale_s=8.0)
+        self._scroll_fraction = 0.0
 
         # Set by the SIGTERM/SIGINT handler; the run() loop polls it.
         self._stop_requested = False
@@ -335,11 +352,6 @@ class RoundTouchDisplay:
         flap_sound.prepare_async()
 
         radar._init_sweep()
-        try:
-            enter_setup = bool(wifi_setup_util.should_enter_setup_at_boot())
-        except Exception:
-            logger.exception("Wi-Fi setup probe failed")
-            enter_setup = False
         # Require Accept every boot (not skipped after a prior accept).
         # No FR24/AIS/ATC/chime/maps/update-check until _accept_safety_disclaimer().
         self.screen = SCREEN_DISCLAIMER
@@ -348,7 +360,7 @@ class RoundTouchDisplay:
         self._disclaimer_deadline: float | None = None
         self._disclaimer_countdown_armed = False
         self._update_check_started = False
-        self._pending_wifi_setup = enter_setup
+        self._pending_wifi_setup = False
         self._migrate_off_hours_dim()
         self._apply_brightness()
         self._safe_draw()
@@ -396,12 +408,6 @@ class RoundTouchDisplay:
             name="update-check",
             daemon=True,
         ).start()
-        try:
-            from utilities import updater
-
-            updater.maybe_auto_install_resync()
-        except Exception:
-            logger.debug("Install re-sync arm failed", exc_info=True)
 
     def _update_check_loop(self) -> None:
         """Force-check GitHub once after boot, then about three times per day."""
@@ -452,9 +458,47 @@ class RoundTouchDisplay:
 
     def _start_session_after_disclaimer(self) -> None:
         """Kick off deferred boot work only after Accept."""
+        if self._session_services_started:
+            return
+        Thread(target=self._deferred_boot_work, name="post-accept", daemon=True).start()
+        self._session_services_started = True
         self._session_unlocked = True
         self._disclaimer_deadline = None
-        self._start_update_check_thread()
+
+    def _tick_audio(self) -> None:
+        now = time.monotonic()
+        if not self._session_unlocked or now - self._audio_tick_at < .25:
+            return
+        if self._audio_tick_thread is not None and self._audio_tick_thread.is_alive():
+            return
+        self._audio_tick_at = now
+        self._audio_tick_thread = Thread(
+            target=self._audio_maintenance, name="audio-tick", daemon=True
+        )
+        self._audio_tick_thread.start()
+
+    @staticmethod
+    def _audio_maintenance() -> None:
+        try:
+            from utilities import atc_audio, lofi_audio
+
+            atc_audio.enforce_quiet_hours()
+            lofi_audio.app_tick()
+        except Exception:
+            logger.debug("Audio tick failed", exc_info=True)
+
+    def _deferred_boot_work(self) -> None:
+        """No pygame or screen changes: network/IPC work must not delay feedback."""
+        try:
+            self._start_update_check_thread()
+        except Exception:
+            logger.debug("Update-check startup failed", exc_info=True)
+        try:
+            from utilities import updater
+
+            updater.maybe_auto_install_resync()
+        except Exception:
+            logger.debug("Install re-sync arm failed", exc_info=True)
         try:
             self.overhead.grab_data()
         except Exception:
@@ -477,6 +521,78 @@ class RoundTouchDisplay:
             except Exception:
                 logger.debug("Post-disclaimer timezone lookup failed", exc_info=True)
         Thread(target=self._resume_atc_after_boot, name="atc-resume", daemon=True).start()
+
+    @staticmethod
+    def _prewarm_maps() -> None:
+        for request in (
+            map_bg.request_background, map_bg.prewarm_all_scales,
+            rainviewer_overlay.request_overlay,
+            lambda: wildfire_overlay.request_refresh(force=True),
+            lambda: earthquake_overlay.request_refresh(force=True),
+        ):
+            try:
+                request()
+            except Exception:
+                logger.debug("Post-accept map warmup failed", exc_info=True)
+
+    def _prepare_startup(self) -> None:
+        try:
+            want_wifi = self._pending_wifi_setup or bool(
+                wifi_setup_util.should_enter_setup_at_boot()
+            )
+            self._startup_result = (bool(want_wifi), None)
+        except Exception as exc:
+            logger.exception("Post-disclaimer startup failed")
+            self._startup_result = (False, exc)
+
+    def _retry_startup(self) -> None:
+        if self._startup_pending:
+            return
+        self._startup_pending = True
+        self._startup_error = False
+        self._startup_result = None
+        # Present feedback before even launching the blocking probe.
+        self._flush_draw(force=True)
+        self._launch_startup_probe()
+
+    def _launch_startup_probe(self) -> None:
+        try:
+            Thread(target=self._prepare_startup, name="startup-wifi", daemon=True).start()
+        except Exception as exc:
+            self._startup_result = (False, exc)
+
+    def _tick_startup(self) -> None:
+        result = self._startup_result
+        if not self._startup_pending or result is None:
+            return
+        self._startup_result = None
+        self._startup_pending = False
+        want_wifi, error = result
+        if error is not None:
+            self._startup_error = True
+            self._safe_draw()
+            return
+        self._pending_wifi_setup = False
+        try:
+            if want_wifi:
+                self._enter_wifi_setup(reason="post-disclaimer")
+            else:
+                self._open_screen(SCREEN_RADAR)
+            self._safe_draw()
+            self._flush_draw(force=True)
+            if self._fatal_error:
+                raise RuntimeError(self._fatal_error)
+            self._start_session_after_disclaimer()
+        except Exception:
+            logger.exception("Could not open the post-disclaimer screen")
+            self._fatal_error = None
+            self.screen = SCREEN_DISCLAIMER
+            self._startup_error = True
+            self._cancel_transition()
+            self._safe_draw()
+            return
+        if not want_wifi:
+            Thread(target=self._prewarm_maps, name="startup-maps", daemon=True).start()
 
     def _enter_wifi_setup(self, *, reason: str = "") -> None:
         """Show the QR screen and start the captive hotspot (idempotent)."""
@@ -546,12 +662,8 @@ class RoundTouchDisplay:
         self._wifi_offline_since = None
         self._wifi_down_streak = 0
         self._fatal_error = None
-        map_bg.request_background()
-        map_bg.prewarm_all_scales()
-        rainviewer_overlay.request_overlay()
-        wildfire_overlay.request_refresh(force=True)
-        earthquake_overlay.request_refresh(force=True)
         self._open_screen(SCREEN_RADAR)
+        Thread(target=self._prewarm_maps, name="wifi-maps", daemon=True).start()
 
     def _disclaimer_countdown_remaining(self) -> int | None:
         """Whole seconds left on remembered auto-continue, or None if inactive."""
@@ -583,7 +695,7 @@ class RoundTouchDisplay:
         Keyboard accept never remembers ("Don't show again" is cleared).
         Returns True when the key was consumed.
         """
-        if self.screen != SCREEN_DISCLAIMER or self._session_unlocked:
+        if self.screen != SCREEN_DISCLAIMER or self._session_unlocked or self._startup_accepted:
             return False
         if time.time() < self._boot_until:
             return False
@@ -600,12 +712,16 @@ class RoundTouchDisplay:
         self, *, from_auto: bool = False, from_keyboard: bool = False
     ) -> None:
         """Continue past the boot disclaimer for this session only."""
-        if self._session_unlocked:
+        if self._session_unlocked or self._startup_accepted or self._startup_pending:
             return
         # Keyboard accept never persists remember — force clear even if the
         # checkbox was checked on screen.
         if from_keyboard:
             self._disclaimer_remember_checked = False
+        self._startup_accepted = True
+        self._startup_pending = True
+        self._disclaimer_deadline = None
+        self._flush_draw(force=True)
         # Persist CURRENT_VERSION only when the on-device checkbox is checked
         # (manual Accept, or the checkbox state at countdown expiry).
         how = ""
@@ -626,29 +742,11 @@ class RoundTouchDisplay:
                 "Safety disclaimer accepted (not remembered)%s",
                 how,
             )
-        self._start_session_after_disclaimer()
-        want_wifi = self._pending_wifi_setup
-        self._pending_wifi_setup = False
-        if not want_wifi:
-            try:
-                want_wifi = bool(wifi_setup_util.should_enter_setup_at_boot())
-            except Exception:
-                logger.exception("Wi-Fi setup probe after disclaimer failed")
-                want_wifi = False
-        if want_wifi:
-            self._enter_wifi_setup(reason="post-disclaimer")
-        else:
-            map_bg.request_background()
-            map_bg.prewarm_all_scales()
-            rainviewer_overlay.request_overlay()
-            wildfire_overlay.request_refresh(force=True)
-            earthquake_overlay.request_refresh(force=True)
-            self._open_screen(SCREEN_RADAR)
-        self._safe_draw()
+        self._launch_startup_probe()
 
     def _tick_disclaimer(self) -> None:
         """Arm / expire remembered auto-continue while the gate is up."""
-        if self.screen != SCREEN_DISCLAIMER or self._session_unlocked:
+        if self.screen != SCREEN_DISCLAIMER or self._session_unlocked or self._startup_accepted:
             return
         self._arm_disclaimer_countdown_if_needed()
         if (
@@ -950,6 +1048,7 @@ class RoundTouchDisplay:
                         radar.current_sweep_angle(),
                         theme.SWEEP,
                         draw_sweep=show_sweep,
+                        present=not self._capture_transition,
                     )
                     self._stage("4_present", time.perf_counter() - _t)
                 else:
@@ -960,6 +1059,7 @@ class RoundTouchDisplay:
                         radar.current_sweep_angle(),
                         theme.SWEEP,
                         draw_sweep=show_sweep,
+                        present=not self._capture_transition,
                     )
                 return
 
@@ -967,12 +1067,15 @@ class RoundTouchDisplay:
             _t = time.perf_counter()
             rotation.present(self._display, self.surface)
             self._stage("4a_rotate", time.perf_counter() - _t)
+            if self._capture_transition:
+                return
             _t = time.perf_counter()
             pygame.display.flip()
             self._stage("4b_flip", time.perf_counter() - _t)
             return
         rotation.present(self._display, self.surface)
-        pygame.display.flip()
+        if not self._capture_transition:
+            pygame.display.flip()
 
     def _draw(self):
         if self._fatal_error:
@@ -995,6 +1098,9 @@ class RoundTouchDisplay:
                 self.surface,
                 remember_checked=self._disclaimer_remember_checked,
                 countdown_s=self._disclaimer_countdown_remaining(),
+                starting=self._startup_pending,
+                startup_error=self._startup_error,
+                reduced_motion=settings.reduce_motion(),
             )
         elif self.screen == SCREEN_WIFI_SETUP:
             wifi_setup_screen.draw_wifi_setup(
@@ -1148,6 +1254,14 @@ class RoundTouchDisplay:
             # Snapshot content+bezel (no ring) and a pre-rotated display base so
             # ring ticks can blit+arc without another full-frame rotate.
             self._capture_timeout_rot_base()
+            if self._timeout_rot_base is not None and not self._tracking_cleared_popup:
+                from utilities import system_control
+
+                if system_control.reboot_progress_copy() is None:
+                    # Present the already-rotated content once; painting the ring
+                    # in display space avoids rotating/copying the same page twice.
+                    self._compose_timeout_frame(remaining)
+                    return
             draw.draw_timeout_ring(self.surface, remaining)
             bezel_applied = True  # already applied inside capture
         else:
@@ -1282,6 +1396,16 @@ class RoundTouchDisplay:
             if val is not None and val != "":
                 overlay[key] = val
 
+        # Follow has its own smoothing history; applying a one-flight list to
+        # the radar smoother would evict every other track.
+        if not hasattr(self, "_follow_smoother"):
+            self._follow_smoother = position_smooth.PositionSmoother(max_extrapolate_s=2.0, stale_s=8.0)
+        if overlay.get("plane_latitude") is None:
+            overlay["plane_latitude"] = overlay.get("latitude")
+        if overlay.get("plane_longitude") is None:
+            overlay["plane_longitude"] = overlay.get("longitude")
+        overlay = self._follow_smoother.apply([overlay], now=time.monotonic())[0]
+
         lat = overlay.get("plane_latitude")
         if lat is None:
             lat = overlay.get("latitude")
@@ -1376,11 +1500,14 @@ class RoundTouchDisplay:
         """Log draw cost and achieved interval every 2s (FLIGHTSCNR_FRAME_DEBUG=1)."""
         now = time.perf_counter()
         gap = (now - self._frame_prev_at) if self._frame_prev_at else 0.0
-        if self._frame_prev_at and gap >= _HITCH_GAP_S:
+        continuous = (
+            self.screen in (SCREEN_RADAR, SCREEN_LIVE) or self._transition is not None
+            or self.input.is_dragging() or bool(self._scroll_momentum_v)
+            or self._timeout_remaining_fraction() is not None
+        )
+        if self._frame_prev_at and continuous and gap >= _HITCH_GAP_S:
             try:
-                from utilities.log_util import HITCH_LOG_MAX_BYTES, append_capped
-
-                append_capped(
+                frame_debug.hitch(
                     _HITCH_LOG,
                     (
                         f"{time.time():.3f}\tgap_ms={gap * 1000:.0f}\t"
@@ -1388,7 +1515,6 @@ class RoundTouchDisplay:
                         f"proc={int(bool(self.overhead.processing))}\t"
                         f"grab={self.overhead.grab_seq}\n"
                     ),
-                    max_bytes=HITCH_LOG_MAX_BYTES,
                 )
             except Exception:
                 pass
@@ -1560,12 +1686,106 @@ class RoundTouchDisplay:
         except Exception:
             logger.debug("Flip board update failed", exc_info=True)
 
+    def _visual_identity(self):
+        screen = self.screen
+        if getattr(self, "_fatal_error", None):
+            screen = "error"
+        elif time.time() < getattr(self, "_boot_until", 0):
+            screen = "boot"
+        return (
+            screen, self.settings_page if screen == SCREEN_SETTINGS else None,
+            rotation.rotation_degrees(), theme.SIZE, settings.display_language(),
+        )
+
+    def _flush_draw(self, *, force=False):
+        if not force and not self._draw_pending:
+            return
+        if not force and self._defer_draws and self._visual_identity() == self._frame_identity:
+            now = time.perf_counter()
+            interactive = (
+                self._transition is not None or self.input.is_dragging()
+                or radial_menu.animating()
+                or bool(self._scroll_momentum_v or self._overscroll or self._overscroll_v)
+            )
+            if not self._pacer.due(now, self._pacer.interval(now, interactive=interactive)):
+                return
+        deferred = self._defer_draws
+        self._defer_draws = False
+        self._draw_pending = False
+        ring_only = self._ring_draw_pending
+        self._ring_draw_pending = False
+        try:
+            if ring_only and self._transition is None:
+                started = time.perf_counter()
+                self._redraw_timeout_ring_only()
+                elapsed = time.perf_counter() - started
+                self._pacer.note_draw(elapsed, time.perf_counter())
+                self._note_frame_time(elapsed)
+            else:
+                self._safe_draw()
+        finally:
+            self._defer_draws = deferred
+
+    def _cancel_transition(self):
+        if self._transition is not None:
+            self._transition = None
+            rotation.invalidate_presented_frame()
+            self._draw_pending = True
+
+    def _present_transition(self, now):
+        done = self._transition.draw(self._display, now)
+        pygame.display.flip()
+        if done:
+            self._transition = None
+            rotation.invalidate_presented_frame()
+            self._draw_pending = True
+
     def _safe_draw(self):
+        if self._defer_draws:
+            self._draw_pending = True
+            self._ring_draw_pending = False
+            return
         # Always track frame gaps for /tmp hitch log; full stage debug is optional.
         started = time.perf_counter()
         try:
-            self._draw()
-            self._note_frame_time(time.perf_counter() - started)
+            key = self._visual_identity()
+            previous = self._frame_identity
+            changed = previous is not None and key != previous
+            if changed:
+                self._transition = None
+                rotation.invalidate_presented_frame()
+            if settings.reduce_motion() or (changed and key[:2] == previous[:2]):
+                self._cancel_transition()
+            if self._transition is not None and not changed:
+                self._present_transition(started)
+            else:
+                animate = (
+                    changed and key[:2] != previous[:2]
+                    and previous[0] not in ("boot", "error", SCREEN_WIFI_SETUP)
+                    and key[0] not in ("boot", "error", SCREEN_WIFI_SETUP, SCREEN_DISCLAIMER)
+                    and (self._session_unlocked or self._startup_accepted)
+                    and not settings.reduce_motion()
+                )
+                source = self._display.copy() if animate else None
+                self._capture_transition = animate
+                if animate:
+                    rotation.invalidate_presented_frame()
+                try:
+                    self._draw()
+                finally:
+                    self._capture_transition = False
+                if animate:
+                    duration = 0.12 if previous[0] == key[0] == SCREEN_SETTINGS else 0.18
+                    self._transition = motion.Crossfade(
+                        source, self._display.copy(), time.perf_counter(), duration
+                    )
+                    self._present_transition(time.perf_counter())
+                self._frame_identity = key
+            elapsed = time.perf_counter() - started
+            if not hasattr(self, "_pacer"):
+                self._pacer = motion.FramePacer()
+            self._pacer.note_draw(elapsed, time.perf_counter())
+            self._note_frame_time(elapsed)
         except pygame.error as exc:
             # Layer prewarm vs present can briefly contend on a surface under
             # heavy traffic; skipping one frame is better than freezing forever.
@@ -1635,14 +1855,15 @@ class RoundTouchDisplay:
         try:
             # Bezel first so ring-only frames can skip it.
             draw.apply_round_bezel(self.surface)
-            self._timeout_content_cache = self.surface.copy()
             self._timeout_content_key = self._timeout_content_cache_key()
             rot = rotation.rotation_degrees()
             if rot == 0:
+                self._timeout_content_cache = self.surface.copy()
                 self._timeout_rot_base = self._timeout_content_cache
             else:
+                self._timeout_content_cache = None
                 self._timeout_rot_base = pygame.transform.rotate(
-                    self._timeout_content_cache, -rot
+                    self.surface, -rot
                 )
             # Force the next ring tick to paint in display space (matches tip erase).
             self._prev_timeout_ring_frac = None
@@ -1656,6 +1877,14 @@ class RoundTouchDisplay:
         (~3ms on the Pi). Tip-only erase looked choppy when dirty rects missed
         the thick stroke; full blit stays within the frame budget.
         """
+        if self._defer_draws:
+            if not self._draw_pending:
+                self._ring_draw_pending = True
+            self._draw_pending = True
+            return
+        if self._transition is not None or self._draw_pending:
+            self._safe_draw()
+            return
         base = self._timeout_rot_base
         if base is None:
             self._safe_draw()
@@ -1666,32 +1895,38 @@ class RoundTouchDisplay:
             self._safe_draw()
             return
         try:
-            display = self._display
-            rot = rotation.rotation_degrees()
-            if display.get_size() == base.get_size():
-                origin = (0, 0)
-                display.blit(base, (0, 0))
-            else:
-                origin = (
-                    (display.get_width() - base.get_width()) // 2,
-                    (display.get_height() - base.get_height()) // 2,
-                )
-                display.fill((0, 0, 0))
-                display.blit(base, origin)
-            cx = origin[0] + base.get_width() * 0.5
-            cy = origin[1] + base.get_height() * 0.5
-            if remaining > 0.001:
-                draw.draw_timeout_ring(
-                    display,
-                    remaining,
-                    rotation_deg=rot,
-                    origin=(cx, cy),
-                )
-            pygame.display.flip()
-            self._prev_timeout_ring_frac = remaining
+            self._compose_timeout_frame(remaining)
         except Exception:
             self._invalidate_timeout_content_cache()
             self._safe_draw()
+
+    def _compose_timeout_frame(self, remaining) -> None:
+        base = self._timeout_rot_base
+        display = self._display
+        rot = rotation.rotation_degrees()
+        if display.get_size() == base.get_size():
+            origin = (0, 0)
+            display.blit(base, (0, 0))
+        else:
+            origin = (
+                (display.get_width() - base.get_width()) // 2,
+                (display.get_height() - base.get_height()) // 2,
+            )
+            display.fill((0, 0, 0))
+            display.blit(base, origin)
+        cx = origin[0] + base.get_width() * 0.5
+        cy = origin[1] + base.get_height() * 0.5
+        if remaining > 0.001:
+            draw.draw_timeout_ring(
+                display,
+                remaining,
+                rotation_deg=rot,
+                origin=(cx, cy),
+            )
+        rotation.invalidate_presented_frame()
+        if not self._capture_transition:
+            pygame.display.flip()
+        self._prev_timeout_ring_frac = remaining
 
     def _preferred_clock_screen(self) -> str:
         """Day or off-hours clock face (Settings › Layers / portal Display)."""
@@ -1784,6 +2019,7 @@ class RoundTouchDisplay:
             ):
                 self._display_focus = 0
         self.settings_page = page
+        self._scroll_fraction = 0.0
 
     def _maybe_reflash_alerts(self, previous_screen: str | None) -> None:
         """Short rim pulse when coming back to radar with an alert still visible."""
@@ -1812,11 +2048,14 @@ class RoundTouchDisplay:
                 tracked.reset_marquee()
             self._scroll.reset()
             self._settings_drag_y = None
+            self._scroll_fraction = 0.0
             self._settings_drag_scrolled = False
             self._settings_pressed_row = None
             self._overscroll = 0.0
             self._overscroll_v = 0.0
         if screen == SCREEN_LIVE and previous != SCREEN_LIVE:
+            if hasattr(self, "_follow_smoother"):
+                self._follow_smoother.reset()
             # Fresh entry into live tracking — force an immediate position fetch.
             self._live_map_last_fetch = 0.0
             self._live_map_last_result = None
@@ -1973,6 +2212,11 @@ class RoundTouchDisplay:
         elif action == "background_texture":
             settings.toggle_background_texture()
             draw.invalidate_background_texture()
+        elif action == "reduce_motion":
+            settings.toggle_reduce_motion()
+            self._cancel_transition()
+            self._scroll_momentum_v = 0.0
+            self._overscroll = self._overscroll_v = 0.0
         elif action == "airport_icon_style":
             self._open_atc_picker("airport_icon_style")
         elif action == "airport_size":
@@ -3687,6 +3931,10 @@ class RoundTouchDisplay:
 
     def _tick_scroll_momentum(self) -> None:
         """Decay-based inertial scroll after a settings flick."""
+        if settings.reduce_motion():
+            self._scroll_momentum_v = 0.0
+            self._overscroll = self._overscroll_v = 0.0
+            return
         if (
             not self._scroll_momentum_v
             and not self._overscroll
@@ -3699,12 +3947,12 @@ class RoundTouchDisplay:
             self._scroll_momentum_v = 0.0
             self._overscroll_v = 0.0
             return
-        now = time.time()
+        now = time.monotonic()
         dt = min(0.1, max(0.0, now - self._scroll_momentum_t))
         self._scroll_momentum_t = now
         if self._scroll_momentum_v:
             before = self._scroll.offset
-            self._apply_scroll_delta(int(round(self._scroll_momentum_v * dt)))
+            self._apply_scroll_delta(self._scroll_momentum_v * dt)
             if self._overscroll:
                 # Fling reached the edge — hand the remaining velocity to the
                 # spring so the bounce depth matches the fling energy.
@@ -3715,19 +3963,16 @@ class RoundTouchDisplay:
             else:
                 # Exponential decay tuned to feel like a platform scroll view.
                 self._scroll_momentum_v *= 0.135 ** dt
-                if abs(self._scroll_momentum_v) < 40.0 or (
-                    self._scroll.offset == before
-                ):
+                if abs(self._scroll_momentum_v) < 40.0:
                     self._scroll_momentum_v = 0.0
                     self._safe_draw()
         elif self._overscroll or self._overscroll_v:
-            # Slightly underdamped spring (zeta ~0.8): one gentle settle,
-            # not a rubber wobble and not a hard exponential stop.
+            # Critically damped settling: return to the edge without a bounce.
             # Integrate in <=8ms substeps — a single hiccup frame at the
             # 100ms dt clamp sat on Euler's stability edge and the spring
             # exploded instead of settling.
             k = 260.0
-            c = 2.0 * 0.8 * math.sqrt(k)
+            c = 2.0 * math.sqrt(k)
             x = self._overscroll
             v = max(-4000.0, min(4000.0, self._overscroll_v))
             steps = max(1, int(math.ceil(dt / 0.008)))
@@ -3771,7 +4016,13 @@ class RoundTouchDisplay:
             # Apple-style edges: excess drag piles into _overscroll and the
             # list springs back on release instead of stopping dead.
             sc = self._scroll
-            target = float(sc.offset) + self._overscroll + float(delta)
+            target = (
+                float(sc.offset) + self._overscroll
+                + getattr(self, "_scroll_fraction", 0.0) + float(delta)
+            )
+            if settings.reduce_motion():
+                target = max(0.0, min(float(sc.max_offset), target))
+                self._overscroll = 0.0
             if target < 0.0:
                 sc.offset = 0
                 self._overscroll = target
@@ -3781,13 +4032,13 @@ class RoundTouchDisplay:
             else:
                 sc.offset = int(round(target))
                 self._overscroll = 0.0
+            self._scroll_fraction = target - sc.offset if not self._overscroll else 0.0
         else:
             self._scroll.step(delta)
         self._note_activity()
         if self.screen == SCREEN_SETTINGS:
-            # Scrolling repaints the whole page; cap it at ~25 fps so touch
-            # events don't queue behind draws, and freeze the ATC labels so
-            # their bluetoothctl/IPC rebuild can't stall mid-gesture.
+            # Queue at interaction cadence; the shared pacer adapts to render
+            # cost. Hold ATC labels steady during the gesture.
             info.hold_atc_labels()
             now_scroll = time.time()
             if now_scroll - self._last_slider_draw < 0.016:
@@ -3922,7 +4173,7 @@ class RoundTouchDisplay:
                             self._settings_pressed_row = row
                             self._note_activity()
                             self._safe_draw()
-                    now_t = time.time()
+                    now_t = time.monotonic()
                     if self._settings_drag_y is None:
                         self._settings_drag_scrolled = False
                         self._scroll_samples = [(now_t, pos[1])]
@@ -3948,8 +4199,11 @@ class RoundTouchDisplay:
                     if t1 - t0 > 0.005:
                         v = (y1 - y0) / (t1 - t0)
                 self._scroll_samples = []
-                self._scroll_momentum_t = time.time()
-                if self._overscroll:
+                self._scroll_momentum_t = time.monotonic()
+                if settings.reduce_motion():
+                    self._scroll_momentum_v = 0.0
+                    self._overscroll = self._overscroll_v = 0.0
+                elif self._overscroll:
                     self._overscroll_v = max(-3000.0, min(3000.0, -v))
                 elif abs(v) > 120.0:
                     self._scroll_momentum_v = -v
@@ -4429,9 +4683,14 @@ class RoundTouchDisplay:
             # Consume all gestures; only checkbox / Accept hit rects act.
             # During a remembered countdown there is no Accept — wait it out.
             gesture = self.input.consume_gesture()
+            if self._startup_pending:
+                return
             if gesture and gesture[0] == "tap":
                 tap = gesture[1]
-                if disclaimer.hit_remember(tap[0], tap[1]):
+                if self._startup_error:
+                    if disclaimer.hit_accept(tap[0], tap[1]):
+                        self._retry_startup()
+                elif disclaimer.hit_remember(tap[0], tap[1]):
                     self._toggle_disclaimer_remember()
                 elif (
                     self._disclaimer_deadline is None
@@ -5951,6 +6210,7 @@ class RoundTouchDisplay:
 
         try:
             while running:
+                self._defer_draws = True
                 if self._stop_requested:
                     logger.info(
                         "Received %s — shutting down",
@@ -6011,6 +6271,8 @@ class RoundTouchDisplay:
                     # Do not recreate the display on WINDOWEXPOSED / FOCUSGAINED —
                     # that races the render loop and can black-screen the kiosk.
                     if gesture_handler.RadarGestureHandler.is_touch_event(event):
+                        if gesture_handler.RadarGestureHandler.is_pointer_down(event) or event.type == pygame.FINGERDOWN:
+                            self._cancel_transition()
                         if not self._ghost_filter.allow(
                             event,
                             self.gestures.touch.cancel_gesture,
@@ -6154,6 +6416,7 @@ class RoundTouchDisplay:
                     if (now - self._last_static_draw) >= 0.25:
                         self._safe_draw()
                         self._last_static_draw = now
+                    self._flush_draw()
                     time.sleep(0.05)
                     continue
 
@@ -6286,7 +6549,6 @@ class RoundTouchDisplay:
                 if self._vessel_photo_redraw and self.screen == SCREEN_FLIGHT:
                     self._vessel_photo_redraw = False
                     self._safe_draw()
-                    self._safe_draw()
 
                 if self._fire_map_redraw and self.screen == SCREEN_FIRE:
                     self._fire_map_redraw = False
@@ -6317,30 +6579,31 @@ class RoundTouchDisplay:
                         self._tick_wifi_setup()
                         if not self._fatal_error:
                             continue
+                    self._flush_draw()
                     time.sleep(1.0)
                     continue
 
                 if now < self._boot_until:
                     self._safe_draw()
-                    time.sleep(0.05)
                 elif self.screen == SCREEN_DISCLAIMER:
+                    self._tick_startup()
                     self._tick_disclaimer()
                     if self.screen != SCREEN_DISCLAIMER:
+                        self._flush_draw()
                         continue
                     # Redraw often enough for a visible Continuing in 8…1 countdown.
                     redraw_iv = (
-                        0.2 if self._disclaimer_deadline is not None else 1.0
+                        1 / 30 if self._startup_pending and not settings.reduce_motion()
+                        else 0.2 if self._disclaimer_deadline is not None else 1.0
                     )
                     if (now - self._last_static_draw) >= redraw_iv:
                         self._safe_draw()
                         self._last_static_draw = now
-                    time.sleep(0.05)
                 elif self.screen == SCREEN_WIFI_SETUP:
                     self._tick_wifi_setup()
                     if (now - self._last_static_draw) >= 0.5:
                         self._safe_draw()
                         self._last_static_draw = now
-                    time.sleep(0.05)
                 elif self.screen == SCREEN_RADAR:
                     radar.tick_sweep()
                     # Keep radar cadence even when the sweep beam is hidden so
@@ -6349,9 +6612,8 @@ class RoundTouchDisplay:
                     # Stamp the schedule *before* drawing. Stamping after made the
                     # interval = draw_time + frame_ms (~35ms) and capped the sweep
                     # at ~28fps even when draws were cheap enough for ~50fps.
-                    now_draw = time.time()
-                    if (now_draw - self._last_radar_draw) * 1000 >= frame_ms:
-                        self._last_radar_draw = now_draw
+                    now_draw = time.perf_counter()
+                    if now_draw >= self._pacer.next_at:
                         self._safe_draw()
                         # Rebuild + pre-rotate the ~10Hz aircraft layer on a
                         # worker thread (same model as 9a130e7). Inline rebuilds
@@ -6389,7 +6651,7 @@ class RoundTouchDisplay:
                     if self.screen == SCREEN_LIVE:
                         # Pin owner polls ~2s while Follow is open; redraw on
                         # grab_seq and this timer for chrome / map pan.
-                        interval = DATA_REFRESH_SECONDS
+                        interval = theme.SWEEP_FRAME_MS / 1000.0
                     else:
                         interval = (
                             theme.SWEEP_FRAME_MS / 1000.0
@@ -6462,10 +6724,7 @@ class RoundTouchDisplay:
                         radar.invalidate_frame_layer()
                         self._safe_draw()
                     try:
-                        from utilities import atc_audio, lofi_audio
-
-                        atc_audio.enforce_quiet_hours()
-                        lofi_audio.app_tick()
+                        self._tick_audio()
                         if lofi_tile.tick():
                             self._safe_draw()
                     except Exception:
@@ -6478,6 +6737,9 @@ class RoundTouchDisplay:
                 if not self._slider_drag_armed():
                     settings.flush_pending()
                 self._loop_stage("loop_misc", _lt)
+                if self._transition is not None:
+                    self._draw_pending = True
+                self._flush_draw()
                 if FRAME_DEBUG:
                     try:
                         body = time.perf_counter() - _body_t
@@ -6491,7 +6753,9 @@ class RoundTouchDisplay:
                 _sleep_t = time.perf_counter()
                 ring_animating = self._timeout_remaining_fraction() is not None
                 requested = (
-                    0.004 if self.screen == SCREEN_RADAR or ring_animating else 0.01
+                    0.004 if self.screen in (SCREEN_RADAR, SCREEN_LIVE)
+                    or ring_animating or self._transition is not None
+                    or self._startup_pending or self.input.is_dragging() else 0.01
                 )
                 time.sleep(requested)
                 if FRAME_DEBUG:

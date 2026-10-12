@@ -110,6 +110,12 @@ def to_logical(x: float, y: float) -> tuple[int, int]:
     return int(side - 1 - y), int(x)
 
 
+def invalidate_presented_frame() -> None:
+    """A compositor replaced display pixels; the fast radar must restore its base."""
+    global _needs_full
+    _needs_full = True
+
+
 def present(display: pygame.Surface, frame: pygame.Surface) -> None:
     """Blit the logical frame onto the physical display, applying rotation."""
     global _prev_sweep_rect, _pending_key, _needs_full
@@ -142,6 +148,7 @@ def present_radar_sweep(
     sweep_color,
     *,
     draw_sweep: bool = True,
+    present: bool = True,
 ) -> None:
     """Blit a cached rotated radar base, then optionally draw the sweep.
 
@@ -377,6 +384,8 @@ def present_radar_sweep(
     radial_dirty = _blit_radial_menu(display, origin_off, rotation)
     _prev_radial_rect = radial_dirty
 
+    if not present:
+        return
     _t = time.perf_counter()
     if full_refresh:
         pygame.display.flip()

@@ -14,10 +14,12 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 
 import pygame
 
 from display.round_touch import draw, theme
+from i18n import tr
 
 logger = logging.getLogger("flightscnr.display")
 
@@ -211,6 +213,9 @@ def draw_disclaimer(
     *,
     remember_checked: bool = False,
     countdown_s: int | None = None,
+    starting: bool = False,
+    startup_error: bool = False,
+    reduced_motion: bool = False,
 ) -> None:
     """Draw the editable disclaimer and register Accept / remember hit rects.
 
@@ -382,7 +387,7 @@ def draw_disclaimer(
         _countdown_rect = status_img.get_rect(midtop=(cx, status_y))
         surface.blit(status_img, _countdown_rect)
     elif _accept_rect is not None:
-        pygame.draw.rect(surface, _BTN, _accept_rect, border_radius=theme.s(11))
+        pygame.draw.rect(surface, _CARD_EDGE if starting else _BTN, _accept_rect, border_radius=theme.s(11))
         pygame.draw.rect(
             surface,
             _BTN_HI,
@@ -390,8 +395,28 @@ def draw_disclaimer(
             width=max(2, theme.s(2)),
             border_radius=theme.s(11),
         )
-        label = btn_font.render(ACCEPT_LABEL, True, theme.LABEL)
+        key = (
+            "disclaimer.startup.starting" if starting else
+            "disclaimer.startup.retry" if startup_error else "disclaimer.accept"
+        )
+        label = btn_font.render(tr(key), True, theme.LABEL)
         surface.blit(label, label.get_rect(center=_accept_rect.center))
+        if starting:
+            radius = theme.s(5)
+            center = (_accept_rect.left + theme.s(12), _accept_rect.centery)
+            if reduced_motion:
+                pygame.draw.circle(surface, theme.MUTED, center, radius, max(1, theme.s(1)))
+            else:
+                angle = time.monotonic() * 4.0
+                box = pygame.Rect(center[0] - radius, center[1] - radius, 2 * radius, 2 * radius)
+                pygame.draw.arc(surface, theme.MUTED, box, angle, angle + math.pi * 1.4, max(1, theme.s(1)))
+        if startup_error:
+            message = status_font.render(tr("disclaimer.startup.error"), True, theme.MUTED)
+            surface.blit(message, message.get_rect(midtop=(cx, status_y)))
+    if starting:
+        _accept_rect = None
+    if starting or startup_error:
+        _remember_rect = None
 
 
 def hit_accept(x: int, y: int) -> bool:

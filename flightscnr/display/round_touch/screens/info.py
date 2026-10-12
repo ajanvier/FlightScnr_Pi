@@ -13,6 +13,7 @@ import socket
 import time
 
 import pygame
+from display.round_touch.async_snapshot import AsyncSnapshot
 
 try:
     from config import (
@@ -91,6 +92,7 @@ DISPLAY_ACTIONS = (
     "zoom_position",
     "rotate",
     "background_texture",
+    "reduce_motion",
     "brightness",
 )
 # Radar clock HUD + hourly chime + enter-range / military / quake SFX.
@@ -186,6 +188,9 @@ _atc_rows_cache: tuple[float, tuple[str, ...]] | None = None
 # the rebuild shells out to bluetoothctl and polls mpv IPC, which blocks
 # the UI thread for hundreds of ms and wrecks the drag.
 _atc_rows_hold_until = 0.0
+_audio_status_snapshot = AsyncSnapshot(0.4)
+_output_devices_snapshot = AsyncSnapshot(5.0)
+_atc_rows_key = None
 
 
 def hold_atc_labels(seconds: float = 1.0) -> None:
@@ -200,6 +205,8 @@ def invalidate_atc_labels() -> None:
     global _atc_rows_cache
     _atc_rows_cache = None
     _atc_picker_cache.clear()
+    _audio_status_snapshot.invalidate()
+    _output_devices_snapshot.invalidate()
 # Full-screen list picker overlay hit targets: ("close"|"item", value).
 # Used for ATC airport/channel/output and other multi-option settings rows.
 _atc_picker_hits: list[tuple[str, str, pygame.Rect]] = []
@@ -425,6 +432,8 @@ def atc_picker_items(kind: str) -> list[dict]:
     kind = str(kind or "").strip().lower()
     if kind not in LIST_PICKER_KINDS:
         return []
+    if kind == "output":
+        return _atc_output_picker_items()
     cached = _atc_picker_cache.get(kind)
     if cached is not None:
         _ts, rows = cached
@@ -712,17 +721,19 @@ def _build_atc_picker_items(kind: str) -> list[dict]:
 
 def _atc_output_picker_items() -> list[dict]:
     """USB audio + connected Bluetooth devices (preferred always listed)."""
-    from utilities import bluetooth_audio
-
     route = settings.audio_route()
     preferred = settings.bluetooth_speaker_mac()
     out: list[dict] = []
 
     usb_label = "USB Audio"
-    try:
-        sink = bluetooth_audio.find_usb_sink()
-    except Exception:
-        sink = None
+    def discover():
+        from utilities import bluetooth_audio
+
+        return bluetooth_audio.find_usb_sink(), bluetooth_audio.list_known_devices()
+
+    sink, devices = _output_devices_snapshot.get(
+        (route, preferred), discover, (None, [])
+    )
     if sink:
         desc = str(sink.get("description") or sink.get("name") or "").strip()
         if desc:
@@ -731,10 +742,6 @@ def _atc_output_picker_items() -> list[dict]:
     out.append({"id": "usb", "label": usb_label, "selected": route != "bluetooth"})
 
     seen: set[str] = set()
-    try:
-        devices = bluetooth_audio.list_known_devices()
-    except Exception:
-        devices = []
     for device in devices:
         mac = str(device.get("mac") or "").strip().upper()
         if not mac or not device.get("connected"):
@@ -2873,12 +2880,10 @@ def _atc_status_label_from_status(st: dict | None) -> str:
     return tr("settings.atc.status", value=st.get("state") or tr("settings.atc.stopped"))
 
 
-def _atc_output_label() -> str:
+def _atc_output_label(st: dict | None = None) -> str:
     """Short current-output label for the Output › row."""
     try:
-        from utilities import bluetooth_audio
-
-        st = bluetooth_audio.status()
+        st = st or {}
         route = str(st.get("audio_route") or settings.audio_route() or "usb")
         name = str(st.get("name") or st.get("mac") or "").strip()
         if name and len(name) > 14:
@@ -2896,20 +2901,24 @@ def _atc_output_label() -> str:
 
 
 def _atc_row_labels() -> list[str]:
-    global _atc_rows_cache
+    global _atc_rows_cache, _atc_rows_key
     now = time.monotonic()
-    if _atc_rows_cache is not None:
+    key = (settings.display_language(), settings.atc_airport(), settings.atc_mount(),
+           settings.audio_route(), settings.bluetooth_speaker_mac(),
+           settings.bluetooth_speaker_name(), settings.atc_enabled(),
+           settings.atc_quiet_hours_enabled(), settings.atc_quiet_start(),
+           settings.atc_quiet_end(), settings.atc_quiet_override(), atc_actions())
+    if _atc_rows_cache is not None and (_atc_rows_key is None or key == _atc_rows_key):
         ts, rows = _atc_rows_cache
         if now - ts < _ATC_LABEL_TTL_S or now < _atc_rows_hold_until:
             return list(rows)
 
-    st: dict | None = None
-    try:
-        from utilities import atc_audio
+    def fetch_status():
+        from utilities import atc_audio, bluetooth_audio
 
-        st = atc_audio.status()
-    except Exception:
-        st = None
+        return atc_audio.status(), bluetooth_audio.status()
+
+    st, output = _audio_status_snapshot.get(key, fetch_status, (None, None))
     all_rows = (
         tr("settings.atc.audio"),
         "",  # volume slider
@@ -2919,7 +2928,7 @@ def _atc_row_labels() -> list[str]:
         tr("settings.atc.lofi_scroll"),
         tr("settings.atc.airport_row", value=_atc_airport_label()),
         tr("settings.atc.channel_row", value=_atc_channel_label_from_status(st)),
-        tr("settings.atc.output_row", value=_atc_output_label()),
+        tr("settings.atc.output_row", value=_atc_output_label(output)),
         _atc_status_label_from_status(st),
     )
     # Keep rows parallel to the gated action list (lofi hides w/o tracks).
@@ -2928,6 +2937,7 @@ def _atc_row_labels() -> list[str]:
         row for action, row in zip(ATC_ACTIONS, all_rows) if action in live
     )
     _atc_rows_cache = (now, rows)
+    _atc_rows_key = key
     return list(rows)
 
 
@@ -3039,6 +3049,7 @@ def _display_row_labels() -> list[str]:
         tr("settings.row.zoom_position", value=settings.radar_zoom_position().title()),
         tr("settings.row.rotate_screen", value=settings.display_rotation()),
         tr("settings.row.background_texture"),
+        tr("settings.row.reduce_motion"),
         "",  # brightness slider
     ]
 
@@ -3114,6 +3125,7 @@ _TOGGLE_ROW_STATE = {
     "color_by_altitude": settings.color_by_altitude,
     "radar_hud": settings.radar_hud_enabled,
     "background_texture": settings.background_texture,
+    "reduce_motion": settings.reduce_motion,
     "zoom_buttons": settings.radar_zoom_buttons,
     "precipitation": settings.show_precipitation,
     "wildfires": settings.show_wildfires,

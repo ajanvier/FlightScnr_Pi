@@ -126,6 +126,7 @@ class TestDisclaimerBootFlow(unittest.TestCase):
     def _bare(self) -> app_mod.RoundTouchDisplay:
         d = object.__new__(app_mod.RoundTouchDisplay)
         d._boot_until = 0.0
+        d._fatal_error = None
         d._session_unlocked = False
         d.screen = app_mod.SCREEN_DISCLAIMER
         d._disclaimer_remembered_boot = False
@@ -138,6 +139,8 @@ class TestDisclaimerBootFlow(unittest.TestCase):
         d._open_screen = lambda screen: d._opened.append(screen)
         d._safe_draw = lambda: None
         d._start_update_check_thread = lambda: None
+        d._prepare_startup = lambda: None  # readiness is delivered explicitly
+        d._prewarm_maps = lambda: None
         return d
 
     def test_arms_countdown_only_when_remembered_and_visible(self):
@@ -234,6 +237,9 @@ class TestDisclaimerBootFlow(unittest.TestCase):
             "display.round_touch.app.wildfire_overlay.request_refresh"
         ):
             d._accept_safety_disclaimer()
+            start.assert_not_called()
+            d._startup_result = (False, None)
+            d._tick_startup()
         remember.assert_called_once()
         clear.assert_not_called()
         start.assert_called_once()
@@ -293,6 +299,9 @@ class TestDisclaimerBootFlow(unittest.TestCase):
             "display.round_touch.app.wildfire_overlay.request_refresh"
         ):
             self.assertTrue(d._try_keyboard_accept_disclaimer())
+            start.assert_not_called()
+            d._startup_result = (False, None)
+            d._tick_startup()
         self.assertFalse(d._disclaimer_remember_checked)
         remember.assert_not_called()
         clear.assert_called_once()

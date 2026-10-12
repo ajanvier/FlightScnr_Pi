@@ -470,6 +470,7 @@ _defaults = {
     "lofi_title_scroll": True,
     # Topo contour texture behind settings/detail screens.
     "background_texture": True,
+    "reduce_motion": False,
     # Faint − / + range-step buttons on the radar rim.
     "radar_zoom_buttons": True,
     # right | left — which rim edge holds the zoom pill.
@@ -817,6 +818,7 @@ def _load():
 
     state = _SettingsState({**_defaults, **data})
     migrated = False
+    state["reduce_motion"] = state.get("reduce_motion") is True
     if "min_height_ft" not in data:
         state["min_height_ft"] = _env_min_height()
         migrated = True
@@ -1351,6 +1353,7 @@ def _settings_snapshot(state: dict) -> tuple:
         bool(state.get("lofi_title_scroll", True)),
         tuple(sorted(str(n) for n in (state.get("lofi_disabled_tracks") or []))),
         bool(state.get("background_texture", True)),
+        bool(state.get("reduce_motion", False)),
         bool(state.get("radar_zoom_buttons", True)),
         str(state.get("radar_zoom_position") or "right"),
         bool(radar_hud_arrange_debug_enabled()),
@@ -3808,6 +3811,17 @@ def set_audio_route(route: str) -> str:
     if value not in ("usb", "bluetooth"):
         value = "usb"
     _rmw_save({"audio_route": value})
+    return value
+
+
+def reduce_motion() -> bool:
+    return _state.get("reduce_motion") is True
+
+
+def toggle_reduce_motion() -> bool:
+    value = not reduce_motion()
+    _state["reduce_motion"] = value
+    _save(_state)
     return value
 
 

@@ -129,6 +129,12 @@ def close() -> None:
     _stamp = None
 
 
+def animating() -> bool:
+    return bool(_entries) and not settings.reduce_motion() and (
+        time.monotonic() - _opened_at < _ANIM_TOTAL_S
+    )
+
+
 def tick() -> bool:
     """True once when the menu times out — caller invalidates the frame."""
     global _closed_reported
@@ -309,7 +315,7 @@ def draw(surface: pygame.Surface) -> pygame.Rect | None:
     rect = _draw_uncached(surface)
     if (
         rect is not None
-        and (time.monotonic() - _opened_at) >= _ANIM_TOTAL_S
+        and (settings.reduce_motion() or (time.monotonic() - _opened_at) >= _ANIM_TOTAL_S)
     ):
         canvas = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
         stamp_rect = _draw_uncached(canvas)
@@ -335,6 +341,8 @@ def _draw_uncached(surface: pygame.Surface) -> pygame.Rect | None:
 
     # Build-around animation timings (seconds since open).
     t = time.monotonic() - _opened_at
+    if settings.reduce_motion():
+        t = _ANIM_TOTAL_S
 
     def _p(t0: float, dur: float) -> float:
         return max(0.0, min(1.0, (t - t0) / dur))
@@ -360,11 +368,8 @@ def _draw_uncached(surface: pygame.Surface) -> pygame.Rect | None:
         )
     wedge_ps = [_p(0.09 + i * 0.022, 0.14) for i in range(n)]
 
-    def _ease_back(p: float) -> float:
-        # Ease-out-back: overshoots slightly past 1 then settles — the pop.
-        k = 1.70158
-        q = p - 1.0
-        return 1.0 + (k + 1.0) * q * q * q + k * q * q
+    def _ease_out(p: float) -> float:
+        return 1.0 - (1.0 - p) ** 4
 
     if all(wp >= 1.0 for wp in wedge_ps):
         pygame.draw.circle(rings, _BAND_DARK, (rc, rc), r_out, r_out - r_mid)
@@ -372,7 +377,7 @@ def _draw_uncached(surface: pygame.Surface) -> pygame.Rect | None:
         for i, wp in enumerate(wedge_ps):
             if wp <= 0.0:
                 continue
-            sc = 0.55 + 0.45 * _ease_back(wp)
+            sc = 0.55 + 0.45 * _ease_out(wp)
             a0 = start + i * step
             arc_ui.draw_arc_bar(
                 rings, cx=rc, cy=rc, r=wedge_r * sc, a0=a0, a1=a0 + step,

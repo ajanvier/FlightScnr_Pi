@@ -1,5 +1,10 @@
 {
   "common.radar": "Radar",
+  "disclaimer.accept": "ELFOGADOM",
+  "disclaimer.startup.starting": "Indítás…",
+  "disclaimer.startup.retry": "Újrapróbálás",
+  "disclaimer.startup.error": "Nem sikerült elindítani",
+  "settings.row.reduce_motion": "Animációk csökkentése",
   "common.clock": "Óra",
   "common.forecast": "Előrejelzés",
   "common.settings": "Beállítások",

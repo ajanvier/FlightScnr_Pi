@@ -1,5 +1,10 @@
 {
   "common.radar": "Radar",
+  "disclaimer.accept": "ACCEPTEREN",
+  "disclaimer.startup.starting": "Opstarten…",
+  "disclaimer.startup.retry": "Opnieuw proberen",
+  "disclaimer.startup.error": "Kan niet starten",
+  "settings.row.reduce_motion": "Animaties verminderen",
   "common.clock": "Klok",
   "common.forecast": "Verwachting",
   "common.settings": "Instellingen",

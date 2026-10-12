@@ -1,5 +1,10 @@
 {
   "common.radar": "Radar",
+  "disclaimer.accept": "ACCEPTER",
+  "disclaimer.startup.starting": "Démarrage…",
+  "disclaimer.startup.retry": "Réessayer",
+  "disclaimer.startup.error": "Démarrage impossible",
+  "settings.row.reduce_motion": "Réduire les animations",
   "common.clock": "Horloge",
   "common.forecast": "Prévisions",
   "common.settings": "Paramètres",
