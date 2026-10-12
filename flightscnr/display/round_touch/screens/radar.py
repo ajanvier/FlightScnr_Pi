@@ -514,14 +514,14 @@ def draw_radar(
     )
     if backdrop is None:
         draw.fill_background(surface)
-        map_bg.request_background()
+        map_bg.request_background(pan_offset=offset)
         map_bg.draw_background(surface, pan_offset=offset)
         rainviewer_overlay.request_overlay()
         rainviewer_overlay.draw_overlay(surface, pan_offset=offset)
         _draw_grid(surface, calibrate=calibrate or pan_mode)
 
     # Keep async map/precip/fire fetch warm even when using the cached backdrop.
-    map_bg.request_background()
+    map_bg.request_background(pan_offset=offset)
     rainviewer_overlay.request_overlay()
     wildfire_overlay.request_refresh()
     earthquake_overlay.request_refresh()

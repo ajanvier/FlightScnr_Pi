@@ -32,12 +32,15 @@ import math
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import hashlib
 
 import pygame
 import requests
 
 from display.round_touch import scale, theme
+from display.round_touch.tile_cache import SurfaceLRU, TileCache, prune_png_cache
 
 logger = logging.getLogger("flightscnr.display")
 
@@ -50,6 +53,11 @@ def _as_display_surface(surface: pygame.Surface, *, alpha: bool = False) -> pyga
     """
     try:
         if not pygame.display.get_init():
+            return surface
+        display = pygame.display.get_surface()
+        if (not alpha and display is not None
+                and surface.get_bitsize() == display.get_bitsize()
+                and surface.get_masks() == display.get_masks()):
             return surface
         return surface.convert_alpha() if alpha else surface.convert()
     except pygame.error:
@@ -126,16 +134,33 @@ CACHE_TTL_S = 7 * 24 * 3600
 # watermarked/unauthorized cached PNGs are not kept after an upgrade.
 # 24: dark/light bands now resize to ring scale (#187). Old unscaled caches
 # would leave aircraft off the roads until the 7-day TTL expired.
-CACHE_STYLE_VERSION = 24
+CACHE_STYLE_VERSION = 25  # rectangular reserve; circle clipping happens at presentation
+
+# Tile/background caches use at most 48 MiB, plus one rotated map (16 MiB).
+# Scratch composition buffers are bounded separately by the single map worker.
+BACKGROUND_MEMORY_BYTES = 32 * 1024**2
+BACKGROUND_DISK_BYTES = 64 * 1024**2
+PAN_MARGIN_PX = TILE_SIZE  # one screen-space tile on each side
+_tiles = TileCache(os.path.join(DATA_DIR, "maps", "tiles"))
 
 
 _lock = threading.Lock()
-_surfaces: dict[tuple, pygame.Surface] = {}
-# Keys already promoted with convert_alpha(). pygame's convert_alpha() always
-# allocates a new Surface, so calling it every get_background() churned ids and
-# invalidated the radar backdrop cache (~every frame).
+_surfaces = SurfaceLRU(BACKGROUND_MEMORY_BYTES, 8)
+# Convert to the opaque display format once. Repeated conversions churn SDL
+# surface ids and invalidate callers' backdrop caches on every frame.
 _display_converted: set[tuple] = set()
 _fetch_threads: dict[tuple, threading.Thread] = {}
+_pending = OrderedDict()
+_fetch_condition = threading.Condition(_lock)
+_map_worker: threading.Thread | None = None
+_generation = 0
+_request_context = None
+_failed_until = {}
+_presentation_cache = SurfaceLRU(16 * 1024**2, 1)
+_last_prewarm_key = None
+_desired_key = None
+_osm_request_lock = threading.Lock()
+_osm_next_request = 0.0
 _stadia_key_warned = False
 _carto_key_warned = False
 
@@ -344,6 +369,10 @@ def _cache_key_for_scale(scale_index: int) -> tuple | None:
         scale_index,
         style,
         carto_auth if carto_auth is not None else -1,
+        scale.bands()[scale_index]["label_km"],
+        theme.VISIBLE_RADIUS,
+        _tile_namespace(style)[1],
+        scale._resolve_units(None),
     )
 
 
@@ -351,7 +380,10 @@ def _cache_path_for_key(key: tuple) -> str:
     lat, lon, scale_idx, style = key[0], key[1], key[2], key[3]
     auth = key[4] if len(key) > 4 else -1
     auth_tag = f"_k{auth}" if auth in (0, 1) else ""
-    return os.path.join(CACHE_DIR, f"bg_{style}{auth_tag}_{lat}_{lon}_{scale_idx}.png")
+    geometry = ""
+    if len(key) > 5:
+        geometry = "_" + hashlib.sha256(repr(key[5:]).encode()).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, f"bg_{style}{auth_tag}_{lat}_{lon}_{scale_idx}{geometry}.png")
 
 
 def _manifest_path_for_key(key: tuple) -> str:
@@ -426,11 +458,11 @@ def _basemap_render_scale(
 
 
 def _lon_to_tile_x(lon: float, zoom: int) -> int:
-    return int((lon + 180.0) / 360.0 * (2 ** zoom))
+    return math.floor((lon + 180.0) / 360.0 * (2 ** zoom))
 
 
 def _lat_to_tile_y(lat: float, zoom: int) -> int:
-    lat_rad = math.radians(lat)
+    lat_rad = math.radians(max(-85.05112878, min(85.05112878, lat)))
     n = 2 ** zoom
     return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
 
@@ -452,11 +484,39 @@ def _tile_nw_lat_lon(z: int, x: int, y: int) -> tuple[float, float]:
 
 
 def _fetch_tile(
+    z: int, x: int, y: int, session: requests.Session, style: str,
+    *, cancelled=lambda: False,
+) -> pygame.Surface | None:
+    style = normalize_map_style(style)
+    n = 1 << z
+    if y < 0 or y >= n:
+        return None
+    x %= n
+    namespace = _tile_namespace(style)
+
+    def load():
+        tile = _download_tile(z, x, y, session, style, cancelled=cancelled)
+        return tile if namespace == _tile_namespace(style) else None
+
+    return _tiles.get_or_load((namespace, z, x, y), load)
+
+
+def _tile_namespace(style):
+    # Authentication changes must not reuse watermarked tiles. Store only a
+    # fingerprint in cache keys, never credentials or token-bearing URLs.
+    auth = _carto_api_key() if style in CARTO_STYLES else (
+        _stadia_api_key() if style in ("stadia_dark", "toner") else ""
+    )
+    return (style, hashlib.sha256(auth.encode()).hexdigest()[:16], 1)
+
+
+def _download_tile(
     z: int,
     x: int,
     y: int,
     session: requests.Session,
     style: str,
+    *, cancelled=lambda: False,
 ) -> pygame.Surface | None:
     if normalize_map_style(style) == "seamap":
         from display.round_touch.seamap_tiles import fetch_tile as fetch_seamap_tile
@@ -483,7 +543,14 @@ def _fetch_tile(
                 style,
             )
     for attempt in range(3):
+        if cancelled():
+            return None
         try:
+            if style == "osm":
+                global _osm_next_request
+                with _osm_request_lock:
+                    time.sleep(max(0, _osm_next_request - time.monotonic()))
+                    _osm_next_request = time.monotonic() + OSM_TILE_DELAY_S
             resp = session.get(url, timeout=20)
             resp.raise_for_status()
             return pygame.image.load(io.BytesIO(resp.content))
@@ -500,30 +567,42 @@ def _fetch_tile_coords(
     coords: list[tuple[int, int]],
     style: str,
 ) -> dict[tuple[int, int], pygame.Surface]:
-    """Download tiles in parallel (CARTO/FAA tolerate concurrent requests)."""
+    """Shared tile cache for the small Follow/route composites."""
+    return {(tx, ty): tile for tx, ty, tile in _iter_tile_coords(zoom, coords, style)}
+
+
+def _iter_tile_coords(zoom, coords, style, *, cancelled=lambda: False):
+    """Stream tiles into the radar canvas with only a few decodes in flight."""
     if not coords:
-        return {}
+        return
 
     style = normalize_map_style(style)
     if style == "black":
-        return {}
+        return
     workers = min(_tile_workers(style), len(coords))
-    results: dict[tuple[int, int], pygame.Surface] = {}
 
     def _download(tx: int, ty: int) -> tuple[int, int, pygame.Surface | None]:
-        session = requests.Session()
-        session.headers["User-Agent"] = USER_AGENT
-        if style == "osm":
-            time.sleep(OSM_TILE_DELAY_S)
-        return tx, ty, _fetch_tile(zoom, tx, ty, session, style)
+        with requests.Session() as session:
+            session.headers["User-Agent"] = USER_AGENT
+            # Only cache misses incur provider pacing.
+            return tx, ty, _fetch_tile(zoom, tx, ty, session, style, cancelled=cancelled)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_download, tx, ty) for tx, ty in coords]
-        for future in as_completed(futures):
-            tx, ty, tile = future.result()
-            if tile is not None:
-                results[(tx, ty)] = tile
-    return results
+        remaining = iter(coords)
+        futures = set()
+        for _ in range(workers):
+            tx, ty = next(remaining)
+            futures.add(pool.submit(_download, tx, ty))
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                tx, ty, tile = future.result()
+                if tile is not None and not cancelled():
+                    yield tx, ty, tile
+                if not cancelled():
+                    coord = next(remaining, None)
+                    if coord is not None:
+                        futures.add(pool.submit(_download, *coord))
 
 
 def _luminance_curve(value: int) -> int:
@@ -873,11 +952,11 @@ def _apply_circle_mask(surface: pygame.Surface) -> pygame.Surface:
 
 
 def _build_flat_black_background() -> pygame.Surface:
-    """Solid black circle — same diameter as tile composites so pan coverage matches."""
-    diameter = theme.VISIBLE_RADIUS * 2 + TILE_SIZE
+    """Rectangular reserve; the bezel is applied at presentation."""
+    diameter = theme.VISIBLE_RADIUS * 2 + PAN_MARGIN_PX * 2
     canvas = pygame.Surface((diameter, diameter))
     canvas.fill(FLAT_BLACK)
-    return _apply_circle_mask(canvas)
+    return canvas
 
 
 def _scalable(tile: pygame.Surface) -> pygame.Surface:
@@ -899,12 +978,15 @@ def _scalable(tile: pygame.Surface) -> pygame.Surface:
     return out
 
 
-def _build_background(scale_index: int, style: str | None = None) -> pygame.Surface | None:
+def _build_background(scale_index: int, style: str | None = None, *,
+                      center=None, radius=None, outer_km=None,
+                      cancelled=lambda: False,
+                      on_complete=lambda complete: None) -> pygame.Surface | None:
     try:
         from config import LOCATION_HOME, location_configured
     except ImportError:
         return None
-    if not location_configured():
+    if center is None and not location_configured():
         return None
     if scale_index < 0 or scale_index >= len(scale.SCALE_BANDS):
         return None
@@ -913,24 +995,30 @@ def _build_background(scale_index: int, style: str | None = None) -> pygame.Surf
     # Otherwise switching Map while prewarm runs can save light tiles under a dark key.
     provider = normalize_map_style(style) if style else _resolved_style()
     if provider == "black":
+        on_complete(True)
         return _build_flat_black_background()
-    home_lat, home_lon = LOCATION_HOME[0], LOCATION_HOME[1]
-    outer_km = scale.bands()[scale_index]["label_km"]
-    px_per_km = theme.GRID_OUTER_RADIUS / outer_km
+    home_lat, home_lon = center if center is not None else tuple(LOCATION_HOME[:2])
+    radius = theme.VISIBLE_RADIUS if radius is None else radius
+    outer_km = scale.bands()[scale_index]["label_km"] if outer_km is None else outer_km
+    px_per_km = (radius - 2) / outer_km
     zoom = _zoom_for_scale(home_lat, px_per_km, provider)
-    render_scale = _basemap_render_scale(home_lat, scale_index, zoom, provider)
+    render_scale = _meters_per_pixel(home_lat, zoom) * px_per_km / 1000.0
+    if not 0.05 < render_scale < 20.0:
+        render_scale = 1.0
 
-    span_km = theme.VISIBLE_RADIUS / px_per_km
+    # OSM's public service permits current-view requests, not zoom-stack prefetch.
+    margin = 0 if provider == "osm" else PAN_MARGIN_PX
+    diameter = int(radius * 2 + margin * 2)
+    span_km = (diameter / 2) / px_per_km
     lat_delta = span_km / 110.574
     cos_lat = max(0.01, math.cos(math.radians(home_lat)))
     lon_delta = span_km / (111.320 * cos_lat)
 
-    x_min = _lon_to_tile_x(home_lon - lon_delta, zoom) - 1
-    x_max = _lon_to_tile_x(home_lon + lon_delta, zoom) + 1
-    y_min = _lat_to_tile_y(home_lat + lat_delta, zoom) - 1
-    y_max = _lat_to_tile_y(home_lat - lat_delta, zoom) + 1
+    x_min = _lon_to_tile_x(home_lon - lon_delta, zoom)
+    x_max = _lon_to_tile_x(home_lon + lon_delta, zoom)
+    y_min = _lat_to_tile_y(home_lat + lat_delta, zoom)
+    y_max = _lat_to_tile_y(home_lat - lat_delta, zoom)
 
-    diameter = theme.VISIBLE_RADIUS * 2 + TILE_SIZE
     center = diameter // 2
     home_px, home_py = _mercator_pixel(home_lat, home_lon, zoom)
 
@@ -938,29 +1026,26 @@ def _build_background(scale_index: int, style: str | None = None) -> pygame.Surf
         (tx, ty)
         for ty in range(y_min, y_max + 1)
         for tx in range(x_min, x_max + 1)
+        if 0 <= ty < 2**zoom
     ]
-    tiles = _fetch_tile_coords(zoom, coords, provider)
-
     scaled = abs(render_scale - 1.0) > 1e-3
     # +1px overlap so scaled tile seams do not leave gaps after rounding.
     scaled_side = max(1, int(math.ceil(TILE_SIZE * render_scale)) + 1) if scaled else TILE_SIZE
 
     canvas = pygame.Surface((diameter, diameter))
     canvas.fill(theme.BG)
-    for ty in range(y_min, y_max + 1):
-        for tx in range(x_min, x_max + 1):
-            tile = tiles.get((tx, ty))
-            if tile is None:
-                continue
-            nw_lat, nw_lon = _tile_nw_lat_lon(zoom, tx, ty)
-            tile_px, tile_py = _mercator_pixel(nw_lat, nw_lon, zoom)
-            px = center + int(round((tile_px - home_px) * render_scale))
-            py = center + int(round((tile_py - home_py) * render_scale))
-            if scaled:
-                tile = pygame.transform.smoothscale(
-                    _scalable(tile), (scaled_side, scaled_side)
-                )
-            canvas.blit(tile, (px, py))
+    received = 0
+    for tx, ty, tile in _iter_tile_coords(zoom, coords, provider, cancelled=cancelled):
+        received += 1
+        tile_px, tile_py = tx * TILE_SIZE, ty * TILE_SIZE
+        px = center + int(round((tile_px - home_px) * render_scale))
+        py = center + int(round((tile_py - home_py) * render_scale))
+        if scaled:
+            tile = pygame.transform.smoothscale(_scalable(tile), (scaled_side, scaled_side))
+        canvas.blit(tile, (px, py))
+    if cancelled():
+        return None
+    on_complete(received == len(coords))
 
     logger.info(
         "Built radar map background (%s, scale %d, %d tiles, zoom %d, "
@@ -973,7 +1058,6 @@ def _build_background(scale_index: int, style: str | None = None) -> pygame.Surf
         render_scale,
     )
     canvas = _style_for_radar(canvas, provider)
-    canvas = _apply_circle_mask(canvas)
     return canvas
 
 
@@ -998,6 +1082,7 @@ def _save_cache(surface: pygame.Surface, key: tuple):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     os.replace(tmp, manifest_path)
+    prune_png_cache(CACHE_DIR, BACKGROUND_DISK_BYTES, 64, prefix="bg_")
 
 
 def _load_cache(key: tuple) -> pygame.Surface | None:
@@ -1057,46 +1142,132 @@ def _remember_surface(key: tuple, surface: pygame.Surface):
     with _lock:
         _surfaces[key] = surface
         _display_converted.discard(key)
+        _display_converted.intersection_update(_surfaces)
 
 
 def _fetch_running(key: tuple) -> bool:
     with _lock:
-        thread = _fetch_threads.get(key)
-        return thread is not None and thread.is_alive()
+        return key in _pending or key in _fetch_threads
 
 
-def _start_fetch(key: tuple):
-    with _lock:
-        thread = _fetch_threads.get(key)
-        if thread is not None and thread.is_alive():
+def _key_context(key):
+    return key[:2] + key[3:5] + key[6:]
+
+
+def _start_fetch(key: tuple, *, priority=0, force=False):
+    global _map_worker, _generation, _request_context, _desired_key
+    with _fetch_condition:
+        context = _key_context(key)
+        if priority == 0:
+            if context != _request_context:
+                _generation += 1
+                _pending.clear()
+                _failed_until.clear()
+                _request_context = context
+            _desired_key = key
+            for old in list(_pending):
+                if _pending[old][0] == 0 and old != key:
+                    del _pending[old]
+        elif context != _request_context:
             return
-        thread = threading.Thread(
-            target=_fetch_worker,
-            args=(key,),
-            name=f"radar-map-fetch-{key[2]}",
-            daemon=True,
-        )
-        _fetch_threads[key] = thread
-        thread.start()
+        retry_after = _failed_until.get(key)
+        if retry_after is not None and retry_after > time.monotonic():
+            return
+        if not force and key in _surfaces and retry_after is None:
+            return
+        force = force or retry_after is not None
+        if key in _fetch_threads:
+            return
+        existing = _pending.get(key)
+        if existing is not None:
+            priority = min(priority, existing[0])
+        _pending[key] = (priority, _generation, force)
+        while len(_pending) > 3:
+            # Preserve demand, drop the least important speculative request.
+            worst = max(_pending, key=lambda k: _pending[k][0])
+            del _pending[worst]
+        if _map_worker is None or not _map_worker.is_alive():
+            _map_worker = threading.Thread(target=_map_worker_loop,
+                                          name="radar-map", daemon=True)
+            _map_worker.start()
+        _fetch_condition.notify_all()
 
 
-def _fetch_worker(key: tuple):
+def _map_worker_loop():
+    while True:
+        with _fetch_condition:
+            while not _pending:
+                _fetch_condition.wait()
+            key = min(_pending, key=lambda k: _pending[k][0])
+            priority, generation, force = _pending.pop(key)
+            _fetch_threads[key] = threading.current_thread()
+        _fetch_worker(key, generation=generation, priority=priority, force=force)
+
+
+def _fetch_worker(key: tuple, *, generation=None, priority=0, force=False):
+    if generation is None:
+        generation = _generation
+
+    def cancelled():
+        with _lock:
+            return generation != _generation or (
+                priority == 0 and key != _desired_key
+            ) or (priority > 0 and _desired_key not in _surfaces and key != _desired_key)
+
     try:
-        # key = (lat, lon, scale_index, style) — use key style, not live settings.
-        surface = _build_background(key[2], style=key[3])
-        if surface is None:
+        if cancelled():
             return
-        if key[3] != "black":
-            _save_cache(surface, key)
-        _remember_surface(key, surface)
+        surface = None if force else _load_cache(key)
+        complete = [True]
+        if surface is None:
+            surface = _build_background(
+                key[2], style=key[3], center=key[:2],
+                outer_km=key[5] if len(key) > 5 else None,
+                radius=key[6] if len(key) > 6 else None,
+                cancelled=cancelled,
+                on_complete=lambda ok: complete.__setitem__(0, ok),
+            )
+            if surface is not None and complete[0] and not cancelled() and key[3] != "black":
+                _save_cache(surface, key)
+        if surface is None or cancelled():
+            return
+        surface = _as_display_surface(surface)
+        facing = _facing()
+        opacity = _chart_opacity(key[3])
+        prepared = None
+        # Only the demanded view owns the one presentation buffer. Neighbour
+        # prefetch must not evict the rotated foreground the user is viewing.
+        if priority == 0 and (abs(facing) >= .05 or opacity != 100):
+            prepared = surface
+            if opacity != 100:
+                prepared, _ = _blend_chart_opacity(surface, opacity, (242, 244, 238), None)
+            if abs(facing) >= .05:
+                prepared = pygame.transform.rotate(prepared, facing)
+        with _lock:
+            if generation == _generation and not (priority == 0 and key != _desired_key):
+                _surfaces[key] = surface
+                _display_converted.discard(key)
+                _display_converted.intersection_update(_surfaces)
+                if prepared is not None:
+                    _presentation_cache[(key, _surfaces.token(key), facing, opacity)] = prepared
+                if complete[0]:
+                    _failed_until.pop(key, None)
+                else:
+                    _failed_until[key] = time.monotonic() + 5.0
     except Exception:
         logger.exception("Radar map background fetch failed for scale %s", key[2])
-    finally:
         with _lock:
+            if generation == _generation:
+                _failed_until[key] = time.monotonic() + 5.0
+    finally:
+        with _fetch_condition:
             _fetch_threads.pop(key, None)
+            if generation == _generation and key == _desired_key and key not in _surfaces:
+                _failed_until[key] = time.monotonic() + 5.0
+            _fetch_condition.notify_all()
 
 
-def request_background(force: bool = False):
+def request_background(force: bool = False, *, pan_offset=None):
     """Load or start fetching the radar map background for the active scale."""
     if not _enabled():
         return
@@ -1105,61 +1276,42 @@ def request_background(force: bool = False):
     if key is None:
         return
 
+    key = _view_key_for_pan(key, pan_offset)
     request_background_for_key(key, force=force)
+    _prewarm_neighbours(key)
 
 
-def request_background_for_key(key: tuple, force: bool = False):
-    """Load or start fetching a cached map for a specific scale key."""
+def request_background_for_key(key: tuple, force: bool = False, *, priority=0):
+    """Non-blocking demand; disk IO and composition stay on the one worker."""
     if not _enabled():
         return
 
-    with _lock:
-        if not force and key in _surfaces:
-            return
-    if _fetch_running(key):
+    _start_fetch(key, priority=priority, force=force)
+
+
+def _prewarm_neighbours(key):
+    global _last_prewarm_key
+    if key == _last_prewarm_key:
         return
-
-    style = key[3] if len(key) > 3 else _resolved_style()
-    if normalize_map_style(style) == "black":
-        _remember_surface(key, _build_flat_black_background())
+    _last_prewarm_key = key
+    if key[3] in ("osm", "black"):
         return
-
-    if not force:
-        cached = _load_cache(key)
-        if cached is not None:
-            _remember_surface(key, cached)
-            return
-
-    _start_fetch(key)
+    # Speculation is deliberately limited to two neighbouring bands. Other
+    # bands remain on disk and are promoted on demand, keeping RAM/CPU bounded.
+    for index in (key[2] - 1, key[2] + 1):
+        if 0 <= index < len(scale.SCALE_BANDS):
+            neighbour = _cache_key_for_scale(index)
+            if neighbour is not None:
+                neighbour = key[:2] + neighbour[2:]
+                request_background_for_key(neighbour, priority=1)
 
 
 def prewarm_all_scales():
-    """Load every scale from disk, then fetch any missing maps one at a time."""
+    """Compatibility entry point: current band first, then adjacent bands."""
     if not _enabled():
         return
 
-    def _worker():
-        for scale_index in range(len(scale.SCALE_BANDS)):
-            key = _cache_key_for_scale(scale_index)
-            if key is None:
-                return
-            request_background_for_key(key)
-            for _ in range(300):
-                with _lock:
-                    if key in _surfaces:
-                        break
-                if not _fetch_running(key):
-                    with _lock:
-                        if key in _surfaces:
-                            break
-                    break
-                time.sleep(0.2)
-
-    threading.Thread(
-        target=_worker,
-        name="radar-map-prewarm",
-        daemon=True,
-    ).start()
+    request_background()
 
 
 def clear_vfr_opacity_blit_cache():
@@ -1174,12 +1326,20 @@ def clear_seamap_opacity_blit_cache():
     _seamap_opacity_blit_cache = None
 
 
-def invalidate():
-    """Drop in-memory backgrounds so the next request rebuilds or reloads."""
-    with _lock:
-        _surfaces.clear()
-        _fetch_threads.clear()
-        _display_converted.clear()
+def invalidate(*, keep_surfaces=False):
+    """Cancel obsolete work; retain bounded previous centres when recentering."""
+    global _generation, _request_context, _desired_key, _last_prewarm_key
+    with _fetch_condition:
+        _generation += 1
+        _request_context = _desired_key = _last_prewarm_key = None
+        _pending.clear()
+        _failed_until.clear()
+        if not keep_surfaces:
+            _surfaces.clear()
+            _display_converted.clear()
+        _fetch_condition.notify_all()
+    if not keep_surfaces:
+        _presentation_cache.clear()
     clear_vfr_opacity_blit_cache()
     clear_seamap_opacity_blit_cache()
 
@@ -1191,8 +1351,71 @@ def cache_token() -> object:
     key = _cache_key()
     if key is None:
         return None
+    source, surface = _background_for_view(key)
+    return (key, source, id(surface) if surface is not None else 0)
+
+
+def _key_projection(key):
+    outer_km = key[5] if len(key) > 5 else scale.bands()[key[2]]["label_km"]
+    radius = key[6] if len(key) > 6 else theme.VISIBLE_RADIUS
+    zoom = _zoom_for_scale(key[0], (radius - 2) / outer_km, key[3])
+    factor = _meters_per_pixel(key[0], zoom) * (radius - 2) / outer_km / 1000.0
+    return zoom, factor if 0.05 < factor < 20 else 1.0
+
+
+def _facing():
+    from display.round_touch import settings
+
+    return float(settings.effective_facing_deg() or 0.0)
+
+
+def _view_key_for_pan(key, pan_offset):
+    if not pan_offset or not any(pan_offset) or key[3] == "black":
+        return key
+    # Snap demand to half-tile steps so a drag doesn't create a job per pixel.
+    step = PAN_MARGIN_PX / 2
+    ox, oy = (round(value / step) * step for value in pan_offset)
+    if ox == oy == 0:
+        return key
+    angle = math.radians(_facing())
+    dx = ox * math.cos(angle) - oy * math.sin(angle)
+    dy = ox * math.sin(angle) + oy * math.cos(angle)
+    zoom, factor = _key_projection(key)
+    px, py = _mercator_pixel(key[0], key[1], zoom)
+    px, py = px - dx / factor, py - dy / factor
+    n = 2**zoom * TILE_SIZE
+    lon = (px / n * 360.0 - 180.0 + 180.0) % 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * py / n))))
+    lat = max(-85.05112878, min(85.05112878, lat))
+    return (round(lat, 5), round(lon, 5)) + key[2:]
+
+
+def _background_for_view(key):
+    """Prefer exact coverage, otherwise reuse a nearby correctly placed reserve."""
     with _lock:
-        return (key, id(_surfaces.get(key)) if key in _surfaces else 0)
+        source = key
+        surface = _surfaces.get(key)
+        if surface is None:
+            zoom, factor = _key_projection(key)
+            px, py = _mercator_pixel(key[0], key[1], zoom)
+            best = float("inf")
+            for candidate in _surfaces:
+                if candidate[2:] != key[2:] or _key_projection(candidate)[0] != zoom:
+                    continue
+                cx, cy = _mercator_pixel(candidate[0], candidate[1], zoom)
+                distance = max(abs(_world_dx(cx - px, zoom)), abs(cy - py)) * factor
+                if distance <= PAN_MARGIN_PX and distance < best:
+                    best, source = distance, candidate
+            if source != key:
+                surface = _surfaces[source]
+        if surface is not None and source not in _display_converted:
+            converted = _as_display_surface(surface)
+            if converted is not surface:
+                _surfaces[source] = converted
+            surface = converted
+            _display_converted.add(source)
+            _display_converted.intersection_update(_surfaces)
+        return source, surface
 
 
 def get_background() -> pygame.Surface | None:
@@ -1201,44 +1424,39 @@ def get_background() -> pygame.Surface | None:
     key = _cache_key()
     if key is None:
         return None
-    if len(key) > 3 and key[3] == "black":
-        with _lock:
-            surface = _surfaces.get(key)
-        if surface is None:
-            _remember_surface(key, _build_flat_black_background())
-    with _lock:
-        surface = _surfaces.get(key)
-        if surface is None:
-            return None
-        # Promote to display format once on the main thread. Re-converting every
-        # call allocates a new Surface and breaks callers that key on id().
-        if key not in _display_converted:
-            converted = _as_display_surface(surface, alpha=True)
-            if converted is not surface:
-                _surfaces[key] = converted
-                surface = converted
-            _display_converted.add(key)
-        return surface
+    return _background_for_view(key)[1]
 
 
 def draw_background(surface: pygame.Surface, pan_offset: tuple[int, int] | None = None):
-    bg = get_background()
+    key = _cache_key()
+    if key is None:
+        return
+    view_key = _view_key_for_pan(key, pan_offset)
+    source, bg = _background_for_view(view_key)
     if bg is None:
         return
     style = _resolved_style()
+    facing = _facing()
+    opacity = _chart_opacity(style)
+    ox = int(pan_offset[0]) if pan_offset else 0
+    oy = int(pan_offset[1]) if pan_offset else 0
+    if source[:2] != key[:2]:
+        zoom, factor = _key_projection(key)
+        px, py = _mercator_pixel(key[0], key[1], zoom)
+        sx, sy = _mercator_pixel(source[0], source[1], zoom)
+        dx, dy = _world_dx(sx - px, zoom) * factor, (sy - py) * factor
+        angle = math.radians(facing)
+        ox += round(dx * math.cos(angle) + dy * math.sin(angle))
+        oy += round(-dx * math.sin(angle) + dy * math.cos(angle))
+    rotation_key = (source, _surfaces.token(source), facing, opacity)
+    prepared = _presentation_cache.get(rotation_key)
+    if prepared is not None:
+        surface.blit(prepared, prepared.get_rect(center=(theme.CENTER_X + ox, theme.CENTER_Y + oy)))
+        return
     if style == "vfr":
         bg = _vfr_with_draw_opacity(bg)
     elif style == "seamap":
         bg = _seamap_with_draw_opacity(bg)
-    facing = 0.0
-    try:
-        from display.round_touch import settings
-
-        facing = float(settings.effective_facing_deg() or 0.0)
-    except Exception:
-        facing = 0.0
-    ox = int(pan_offset[0]) if pan_offset else 0
-    oy = int(pan_offset[1]) if pan_offset else 0
     if abs(facing) < 0.05:
         rect = bg.get_rect(center=(theme.CENTER_X + ox, theme.CENTER_Y + oy))
         surface.blit(bg, rect)
@@ -1246,8 +1464,33 @@ def draw_background(surface: pygame.Surface, pan_offset: tuple[int, int] | None 
     # pygame rotates CCW; facing east-up needs the north-up map rotated CCW
     # so east moves to the top (same sense as geo.rotate_offset / the rose).
     rotated = pygame.transform.rotate(bg, facing)
+    _presentation_cache[rotation_key] = rotated
     rect = rotated.get_rect(center=(theme.CENTER_X + ox, theme.CENTER_Y + oy))
     surface.blit(rotated, rect)
+
+
+def _world_dx(dx, zoom):
+    world = 2**zoom * TILE_SIZE
+    return (dx + world / 2) % world - world / 2
+
+
+def _chart_opacity(style):
+    from display.round_touch import settings
+
+    return (settings.vfr_map_opacity() if style == "vfr" else
+            settings.seamap_opacity() if style == "seamap" else 100)
+
+
+def cache_stats():
+    """Diagnostic counters; these are raster budgets, not process RSS."""
+    with _lock:
+        return {"background_bytes": _surfaces.bytes_used,
+                "background_limit": BACKGROUND_MEMORY_BYTES,
+                "tile_bytes": _tiles.memory.bytes_used,
+                "tile_limit": _tiles.memory.max_bytes,
+                "presentation_bytes": _presentation_cache.bytes_used,
+                "presentation_limit": _presentation_cache.max_bytes,
+                "pending": len(_pending), "building": len(_fetch_threads)}
 
 
 def _basemap_zoom_for_home(home_lat: float) -> int | None:

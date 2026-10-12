@@ -3201,7 +3201,7 @@ class RoundTouchDisplay:
         from display.round_touch import weather_data
 
         set_location_home(lat, lon)
-        map_bg.invalidate()
+        map_bg.invalidate(keep_surfaces=True)
         map_bg.prewarm_all_scales()
         rainviewer_overlay.invalidate()
         rainviewer_overlay.request_overlay()
@@ -3269,7 +3269,7 @@ class RoundTouchDisplay:
         from display.round_touch import weather_data
 
         set_location_home(lat, lon)
-        map_bg.invalidate()
+        map_bg.invalidate(keep_surfaces=True)
         map_bg.prewarm_all_scales()
         rainviewer_overlay.invalidate()
         rainviewer_overlay.request_overlay()
@@ -5751,7 +5751,7 @@ class RoundTouchDisplay:
 
             if not reload_location_override():
                 return
-            map_bg.invalidate()
+            map_bg.invalidate(keep_surfaces=True)
             map_bg.prewarm_all_scales()
             rainviewer_overlay.invalidate()
             rainviewer_overlay.request_overlay()

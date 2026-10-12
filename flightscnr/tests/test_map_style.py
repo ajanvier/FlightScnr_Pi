@@ -196,8 +196,8 @@ class TestMapStyle(unittest.TestCase):
             with patch.object(map_bg, "_carto_api_key", return_value="secret"):
                 key_yes = map_bg._cache_key_for_scale(0)
 
-        self.assertEqual(key_no[-1], 0)
-        self.assertEqual(key_yes[-1], 1)
+        self.assertEqual(key_no[4], 0)
+        self.assertEqual(key_yes[4], 1)
         self.assertNotEqual(key_no, key_yes)
 
     def test_load_cache_rejects_mismatched_carto_auth(self):
