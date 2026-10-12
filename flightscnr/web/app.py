@@ -262,6 +262,28 @@ def _portal_no_store_json(response):
     return response
 
 
+def _portal_catalog():
+    from display.round_touch import settings
+    from i18n import catalog_for
+
+    settings.sync_from_disk()
+    return catalog_for(settings.display_language())
+
+
+def _portal_tr(key: str, **values) -> str:
+    return _portal_catalog().translate(key, **values)
+
+
+@app.context_processor
+def _portal_template_i18n():
+    selection = _portal_catalog()
+    return {
+        "effective_language": selection.effective_language,
+        "tr": selection.translate,
+        "i18n_messages": dict(selection.messages),
+    }
+
+
 @app.get("/wifi")
 def wifi_setup_page():
     return render_template("wifi_setup.html")
@@ -1907,6 +1929,18 @@ def off_hours_save():
 # Serve map files from the data directory
 @app.get("/maps/<path:filename>")
 def maps(filename):
+    # Rebuild the two data maps in the current portal language, in memory.
+    # Existing generated files remain available to other callers.
+    if filename in ("closest.html", "farthest.html"):
+        from web import map_generator
+
+        if filename == "closest.html":
+            entries = load_json(CLOSEST_FILE, [])
+            generate = map_generator.generate_closest_map
+        else:
+            entries = load_json(FARTHEST_FILE, [])
+            generate = map_generator.generate_farthest_map
+        return generate(entries, filename=None, catalog=_portal_catalog())
     return send_from_directory(MAPS_DIR, filename)
 
 
