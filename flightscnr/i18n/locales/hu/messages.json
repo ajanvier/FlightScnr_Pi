@@ -910,9 +910,9 @@
   "settings.row.alert_emergency": "Riasztás vészhelyzeti transzponderkódra (7700/7600/7500)",
   "settings.row.hide_non_alerted": "Nem riasztott repülőgépek elrejtése a radaron",
   "flight.breadcrumb.follow": "Követés",
-  "radar_hud.channel.speaker": "HANGSZÓRÓ",
-  "radar_hud.channel.chime": "HANGJELZÉS",
-  "radar_hud.channel.alert": "RIASZTÁS",
+  "radar_hud.channel.speaker": "Fő hangerő",
+  "radar_hud.channel.chime": "Óránkénti jelzés",
+  "radar_hud.channel.alert": "Riasztás",
   "radar_hud.channel.atc": "ATC",
   "draw.display_error": "Kijelzőhiba",
   "draw.return_to_radar": "Koppints vagy húzz a radarhoz való visszatéréshez",
@@ -942,7 +942,7 @@
   "settings.opt.airport_size.small_paved": "Kicsi (csak burkolt)",
   "settings.opt.airport_size.small": "Minden kis repülőtér",
   "radar_hud.channel.lofi": "LoFi",
-  "radar_hud.floor": "FLOOR",
+  "radar_hud.floor": "MIN. MAG.",
   "favourite.saved_default": "Mentve",
   "favourite.title": "Kedvencek",
   "lofi.plays_under_atc": "Az ATC alatt szól",
@@ -1258,5 +1258,6 @@
   "updates.reset_error": "A gyári visszaállítás nem indítható: {error}",
   "updates.reset_started": "Tiszta telepítés elindítva. Ez az oldal lekapcsolódik; várjon néhány percet a Pi újratelepítésére és újraindítására.",
   "portal.response.keys_restarted": "API-kulcsok mentve és alkalmazás újraindítva.",
-  "portal.response.keys_saved": "API-kulcsok mentve. A kijelzőn való alkalmazáshoz indítsa újra az alkalmazást: sudo systemctl restart flightscnr"
+  "portal.response.keys_saved": "API-kulcsok mentve. A kijelzőn való alkalmazáshoz indítsa újra az alkalmazást: sudo systemctl restart flightscnr",
+  "radar_hud.aqi": "AQI"
 }

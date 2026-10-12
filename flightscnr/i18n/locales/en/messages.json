@@ -1258,5 +1258,6 @@
   "updates.reset_error": "Could not start factory reset: {error}",
   "updates.reset_started": "Clean install started. This page will go offline; wait several minutes for the Pi to reinstall and reboot.",
   "portal.response.keys_restarted": "API keys saved and app restarted.",
-  "portal.response.keys_saved": "API keys saved. Restart the app to apply on the display: sudo systemctl restart flightscnr"
+  "portal.response.keys_saved": "API keys saved. Restart the app to apply on the display: sudo systemctl restart flightscnr",
+  "radar_hud.aqi": "AQI"
 }
