@@ -19,6 +19,7 @@ from i18n import tr
 
 _font_cache = {}
 _text_cache: dict = {}
+_fit_text_cache: dict = {}
 _TEXT_CACHE_MAX = 512
 _sweep_overlay: pygame.Surface | None = None
 _sweep_overlay_size = (0, 0)
@@ -48,6 +49,7 @@ def reset_font_cache() -> None:
     """
     _font_cache.clear()
     _text_cache.clear()
+    _fit_text_cache.clear()
 
 
 def load_font(size: int, bold=False) -> pygame.font.Font:
@@ -90,12 +92,24 @@ def circle_half_width_at_row(row_y: int, row_h: int) -> int:
 def fit_text(text: str, font: pygame.font.Font, max_width: int) -> str:
     if max_width <= 0 or not text:
         return text
-    if font.size(text)[0] <= max_width:
+    # Chord widths change while scrolling. Retain the exact prefix measurements
+    # rather than asking FreeType to shape every prefix on every frame.
+    key = (font, text)
+    metrics = _fit_text_cache.get(key)
+    if metrics is None:
+        if len(_fit_text_cache) >= 256:
+            _fit_text_cache.clear()
+        metrics = (font.size(text)[0], None)
+        _fit_text_cache[key] = metrics
+    full_width, prefixes = metrics
+    if full_width <= max_width:
         return text
-    for n in range(len(text), 0, -1):
-        trial = text[:n] + "…"
-        if font.size(trial)[0] <= max_width:
-            return trial
+    if prefixes is None:
+        prefixes = tuple(font.size(text[:n] + "…")[0] for n in range(1, len(text) + 1))
+        _fit_text_cache[key] = (full_width, prefixes)
+    for n in range(len(prefixes), 0, -1):
+        if prefixes[n - 1] <= max_width:
+            return text[:n] + "…"
     return "…"
 
 
@@ -717,14 +731,35 @@ def draw_timeout_ring(
     rot = int(rotation_deg) % 360
     if rot:
         overlay = pygame.transform.rotate(overlay, -rot)
-    surface.blit(
-        overlay,
-        (int(round(cx - overlay.get_width() * 0.5)),
-         int(round(cy - overlay.get_height() * 0.5))),
-    )
+    ox = int(round(cx - overlay.get_width() * 0.5))
+    oy = int(round(cy - overlay.get_height() * 0.5))
+    # Only the rim contains pixels. Avoid alpha-blending the large transparent
+    # centre on every scroll/ring frame, keeping the original raster exactly.
+    for rect in _timeout_ring_blit_rects(side, r, width):
+        surface.blit(overlay, (ox + rect.x, oy + rect.y), rect)
 
 
 _ring_overlay_cache: dict[int, pygame.Surface] = {}
+_ring_blit_cache: dict = {}
+
+
+def _timeout_ring_blit_rects(side, radius, width):
+    key = (side, radius, width)
+    rects = _ring_blit_cache.get(key)
+    if rects is None:
+        rects = []
+        inner = max(0, radius - width - 4)
+        center = side / 2
+        for y0 in range(0, side, max(1, side // 32)):
+            y1 = min(side, y0 + max(1, side // 32))
+            dy = max(abs(y0 - center), abs(y1 - 1 - center))
+            half = int(math.sqrt(max(0, inner * inner - dy * dy)))
+            left, right = int(center - half), int(center + half)
+            rects.append(pygame.Rect(0, y0, left, y1 - y0))
+            rects.append(pygame.Rect(right, y0, side - right, y1 - y0))
+        _ring_blit_cache.clear()
+        _ring_blit_cache[key] = rects
+    return rects
 
 
 def _timeout_ring_overlay(side: int) -> pygame.Surface:

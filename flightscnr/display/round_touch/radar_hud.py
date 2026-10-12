@@ -18,6 +18,7 @@ from datetime import datetime
 import pygame
 
 from display.round_touch import draw as draw_mod, settings, theme
+from display.round_touch.async_snapshot import AsyncSnapshot
 from i18n import tr
 
 # Volume popover stays open until dismissed or this idle timeout.
@@ -27,6 +28,8 @@ _volume_popover = False
 _popover_channel: str | None = None
 _popover_until = 0.0
 _last_minute_key: str | None = None
+_weather_snapshot = AsyncSnapshot(2.0)
+_playing_snapshot = AsyncSnapshot(.4)
 # Cached hit targets in logical coords (updated each draw).
 _chime_rect = pygame.Rect(0, 0, 0, 0)
 _speaker_rect = pygame.Rect(0, 0, 0, 0)
@@ -582,6 +585,13 @@ def _geometry(wx: dict | None = None) -> dict:
     }
 
 
+def _atc_playing() -> bool:
+    from utilities import atc_audio
+
+    key = (settings.atc_enabled(), settings.atc_airport(), settings.atc_mount())
+    return bool(_playing_snapshot.get(key, atc_audio.is_playing, False))
+
+
 def _fill_alpha() -> int:
     """Map 0–100% opacity setting to blit alpha."""
     pct = settings.radar_hud_opacity()
@@ -658,10 +668,10 @@ _OFF_ICON_ALPHA = 110
 def _icon_as_light(icon: pygame.Surface) -> pygame.Surface:
     """Invert dark glyph RGB so icons read on a dark pill (preserve alpha)."""
     out = icon.copy()
-    # pixels3d is RGB only; alpha stays on the surface.
-    rgb = pygame.surfarray.pixels3d(out)
-    rgb[:] = 255 - rgb
-    del rgb
+    # SDL can invert RGB without importing NumPy on the first radar frame.
+    # RGB-only blend flags preserve the original per-pixel alpha.
+    out.fill((255, 255, 255), special_flags=pygame.BLEND_RGB_MAX)
+    out.blit(icon, (0, 0), special_flags=pygame.BLEND_RGB_SUB)
     return out
 
 
@@ -674,6 +684,18 @@ def _hud_chrome() -> tuple[tuple[int, int, int], tuple[int, int, int, int]]:
 
 
 def _wx_snapshot() -> dict | None:
+    from display.round_touch import weather_data
+    from weather_prefs import unit_symbol
+    from config import LOCATION_HOME
+
+    want = unit_symbol()
+    cached = weather_data.snapshot()
+    if cached is not None and cached.get("unit") != want:
+        cached = None
+    return _weather_snapshot.get((want, tuple(LOCATION_HOME)), _fetch_wx_snapshot, cached)
+
+
+def _fetch_wx_snapshot() -> dict | None:
     try:
         from display.round_touch import weather_data
         from weather_prefs import unit_symbol
@@ -1247,9 +1269,7 @@ def draw_hud(
         # ATC enable — full opacity while playing, mid when enabled/stopped, dim when off.
         atc_playing = False
         try:
-            from utilities import atc_audio
-
-            atc_playing = bool(atc_audio.is_playing())
+            atc_playing = _atc_playing()
         except Exception:
             atc_playing = False
         atc_on = (
@@ -1503,9 +1523,7 @@ def _overlay_signature() -> tuple:
     """Inputs that change the painted pill. Cheap enough to check every layer."""
     wx_key = None
     try:
-        from display.round_touch import weather_data
-
-        wx = weather_data.snapshot()
+        wx = _wx_snapshot()
     except Exception:
         wx = None
     if wx:
@@ -1520,9 +1538,7 @@ def _overlay_signature() -> tuple:
         )
     playing = False
     try:
-        from utilities import atc_audio
-
-        playing = bool(atc_audio.is_playing())
+        playing = _atc_playing()
     except Exception:
         playing = False
     return (

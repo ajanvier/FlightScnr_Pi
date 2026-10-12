@@ -34,8 +34,9 @@ _gap: dict[str, float] = {}
 _counters: dict[str, int] = {}
 
 _log = logging.getLogger("flightscnr.display")
-_log_q: queue.SimpleQueue | None = None
+_log_q: queue.Queue | None = None
 _log_thread: threading.Thread | None = None
+_log_start_lock = threading.Lock()
 
 
 def count(name: str, n: int = 1) -> None:
@@ -73,28 +74,49 @@ def _log_writer() -> None:
         item = _log_q.get()
         if item is None:
             return
-        level, msg, args = item
-        _log.log(level, msg, *args)
+        try:
+            if item[0] == "hitch":
+                from utilities.log_util import HITCH_LOG_MAX_BYTES, append_capped
+
+                append_capped(item[1], item[2], max_bytes=HITCH_LOG_MAX_BYTES)
+            else:
+                _, level, msg, args = item
+                _log.log(level, msg, *args)
+        except Exception:
+            # A full/unwritable disk must not kill the collector or freeze SDL.
+            pass
 
 
 def _ensure_log_thread() -> None:
     global _log_q, _log_thread
-    if _log_thread is not None:
-        return
-    _log_q = queue.SimpleQueue()
-    _log_thread = threading.Thread(
-        target=_log_writer, name="frame-debug-log", daemon=True
-    )
-    _log_thread.start()
+    with _log_start_lock:
+        if _log_thread is not None:
+            return
+        _log_q = queue.Queue(maxsize=256)
+        _log_thread = threading.Thread(
+            target=_log_writer, name="frame-debug-log", daemon=True
+        )
+        _log_thread.start()
+
+
+def _enqueue(item) -> None:
+    _ensure_log_thread()
+    try:
+        _log_q.put_nowait(item)
+    except queue.Full:
+        pass
+
+
+def hitch(path: str, line: str) -> None:
+    """Always-on capped hitch file, written off the display thread."""
+    _enqueue(("hitch", path, line))
 
 
 def log(level: int, msg: str, *args) -> None:
     """Non-blocking log from the display thread."""
     if not ENABLED:
         return
-    _ensure_log_thread()
-    assert _log_q is not None
-    _log_q.put((level, msg, args))
+    _enqueue(("log", level, msg, args))
 
 
 if ENABLED:
