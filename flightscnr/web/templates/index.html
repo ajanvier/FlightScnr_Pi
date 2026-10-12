@@ -386,7 +386,7 @@
                 <label for="show_earthquakes">Show earthquakes</label>
                 <span class="switch"><input id="show_earthquakes" type="checkbox"><span class="track"></span></span>
             </div>
-            <p class="hint">Global M2.5+ epicenters from the <a href="https://earthquake.usgs.gov/" target="_blank" rel="noopener">USGS</a> catalog (no API key), last 24 hours — same default window as the USGS live map. PAGER impact alerts and tsunami bulletins show on the detail page. Tap a marker for magnitude, depth, and place. Refreshes every minute and on recenter. Voice alerts are under Display, screens &amp; volume (device: Settings → HUD &amp; Volume).</p>
+            <p class="hint"><span data-i18n="portal.radar.earthquakes.hint_before_source" data-i18n-before-link>Global M2.5+ epicenters from the </span><a href="https://earthquake.usgs.gov/" target="_blank" rel="noopener">USGS</a> <span data-i18n="portal.radar.earthquakes.hint_after_source">catalog (no API key), last 24 hours — same default window as the USGS live map. PAGER impact alerts and tsunami bulletins show on the detail page. Tap a marker for magnitude, depth, and place. Refreshes every minute and on recenter. Voice alerts are under Display, screens &amp; volume (device: Settings → HUD &amp; Volume).</span></p>
             <div class="chk">
                 <label for="show_airport_centerlines">Show airport centerlines</label>
                 <span class="switch"><input id="show_airport_centerlines" type="checkbox"><span class="track"></span></span>
@@ -1058,7 +1058,7 @@
             <div class="track-row" style="margin-top:.55rem">
                 <button class="btn btn-primary" id="btn-export-diagnostics" type="button">Download diagnostics</button>
             </div>
-            <p class="hint" style="margin-top:.85rem">Restore from a previously downloaded <code>.config</code> file. This overwrites matching preference files on the Pi and relaunches the app.</p>
+            <p class="hint" style="margin-top:.85rem"><span data-i18n="portal.system.restore.hint_before_extension">Restore from a previously downloaded</span> <code>.config</code> <span data-i18n="portal.system.restore.hint_after_extension">file. This overwrites matching preference files on the Pi and relaunches the app.</span></p>
             <div class="track-row" style="margin-top:.55rem;align-items:center;flex-wrap:wrap;gap:.5rem">
                 <input id="import-settings-file" type="file" accept=".config,application/json,text/json" style="max-width:100%">
                 <button class="btn btn-primary" id="btn-import-settings" type="button">Upload &amp; apply</button>
@@ -1202,7 +1202,10 @@ function applyI18nCatalog(data) {
     document.documentElement.lang = i18nState.effective_language || "en";
     document.querySelectorAll("[data-i18n]").forEach((el) => {
         const key = el.dataset.i18n;
-        const translated = i18nText(key, el.textContent || "");
+        let translated = i18nText(key, el.textContent || "");
+        if (el.hasAttribute("data-i18n-before-link") && !/[\s'’]$/.test(translated)) {
+            translated += " ";
+        }
         el.textContent = translated;
     });
     document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
