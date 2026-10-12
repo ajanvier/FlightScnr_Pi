@@ -18,6 +18,7 @@ reboot restores the previous location, not necessarily Home.
 from __future__ import annotations
 
 import json
+from i18n import tr
 import logging
 import os
 import re
@@ -282,10 +283,10 @@ def active_label() -> str:
     reload()
     idx = active_index()
     if idx == CUSTOM_INDEX:
-        return "Custom"
+        return tr("settings.favourite.custom")
     if idx < 0:
-        return "Home"
-    name = _state["locations"][idx].get("name") or "Saved"
+        return tr("settings.favourite.home")
+    name = _state["locations"][idx].get("name") or tr("settings.favourite.saved")
     if len(name) > 18:
         return name[:17] + "…"
     return name
