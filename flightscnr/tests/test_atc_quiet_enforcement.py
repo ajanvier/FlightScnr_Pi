@@ -53,6 +53,13 @@ def _spy(monkeypatch, *, playing, quiet, want=True, enabled=True):
 
 
 class TestQuietEnforcement:
+    def test_first_check_runs_immediately_after_system_boot(self, monkeypatch):
+        calls = _spy(monkeypatch, playing=True, quiet=True)
+        monkeypatch.setattr(atc_audio.time, "monotonic", lambda: 1.0)
+        atc_audio.enforce_quiet_hours()
+        atc_audio.enforce_quiet_hours()
+        assert calls["stop"] == 1
+
     def test_stops_live_stream_when_quiet_begins(self, monkeypatch):
         calls = _spy(monkeypatch, playing=True, quiet=True)
         atc_audio.enforce_quiet_hours()

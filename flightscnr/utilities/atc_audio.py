@@ -1687,7 +1687,7 @@ def enforce_quiet_hours() -> None:
     """
     global _last_quiet_check
     now_mono = time.monotonic()
-    if now_mono - _last_quiet_check < 30.0:
+    if _last_quiet_check and now_mono - _last_quiet_check < 30.0:
         return
     _last_quiet_check = now_mono
     try:
