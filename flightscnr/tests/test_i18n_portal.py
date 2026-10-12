@@ -373,7 +373,6 @@ def test_secondary_pages_render_in_selected_language(portal, language, path, key
     assert f'<title data-i18n="{key}">{title}</title>' in html
 
 
-
 def test_captive_wifi_works_without_catalog_request(portal, monkeypatch):
     client, settings, web_app, _tmp_path = portal
     settings.set_display_language("fr")
@@ -385,6 +384,29 @@ def test_captive_wifi_works_without_catalog_request(portal, monkeypatch):
     assert "const I18N_MESSAGES = " in html
     assert 'fetch("/i18n/catalog.json' not in html
 
+
+def test_response_copy_uses_newly_selected_language(portal):
+    from i18n import catalog_for
+
+    client, _settings, _web_app, _tmp_path = portal
+    response = client.post("/display", json={"display_language": "fr"})
+    french = catalog_for("fr")
+    assert response.get_json()["message"] == french.translate("portal.response.display_saved")
+    response = client.post("/route/search", json={"origin": "SFO"})
+    assert response.status_code == 400
+    assert response.get_json()["error"] == french.translate("portal.response.route_required")
+
+
+def test_wifi_validation_uses_saved_language_preference(portal, monkeypatch):
+    from i18n import catalog_for
+    from utilities import wifi_setup
+
+    client, settings, _web_app, _tmp_path = portal
+    settings.set_display_language("hu")
+    monkeypatch.setattr(wifi_setup, "_SETTINGS_JSON_PATH", settings.SETTINGS_PATH)
+    response = client.post("/wifi/connect", json={"ssid": ""})
+    assert response.status_code == 400
+    assert response.get_json()["message"] == catalog_for("hu").translate("wifi.ssid_required")
 
 
 def test_maps_follow_language_switch_and_render_in_memory(portal, monkeypatch):
