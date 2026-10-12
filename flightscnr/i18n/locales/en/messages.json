@@ -979,5 +979,10 @@
   "power.close_hint": "Tap outside to close",
   "power.reboot": "Reboot",
   "power.shutdown": "Shut down",
-  "power.restart": "Restart app"
+  "power.restart": "Restart app",
+  "portal.weather.providers_hint": "Tomorrow.io is preferred when enabled and configured. Open-Meteo automatically supplies weather if Tomorrow.io is unavailable, including when its switch is off. No Open-Meteo API key is needed.",
+  "portal.weather.fetch.providers_hint": "Requests a current-weather refresh from the display, with automatic Open-Meteo fallback. Clears the local Tomorrow.io backoff; server quotas still apply. Current weather and wind refresh at :01 and :31; forecasts at :01. Use manual refresh sparingly.",
+  "weather.attribution.data": "Weather: {providers}",
+  "weather.attribution.icons": "Icons: Tomorrow.io",
+  "weather.providers_unavailable": "Weather services unavailable - retrying automatically"
 }

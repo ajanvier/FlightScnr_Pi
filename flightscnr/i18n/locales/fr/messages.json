@@ -979,5 +979,10 @@
   "power.close_hint": "Toucher à côté pour fermer",
   "power.reboot": "Redémarrer",
   "power.shutdown": "Éteindre",
-  "power.restart": "Redémarrer l'app"
+  "power.restart": "Redémarrer l'app",
+  "portal.weather.providers_hint": "Tomorrow.io est prioritaire lorsqu’il est activé et configuré. Open-Meteo fournit automatiquement la météo si Tomorrow.io est indisponible, y compris lorsque son interrupteur est désactivé. Aucune clé API Open-Meteo n’est nécessaire.",
+  "portal.weather.fetch.providers_hint": "Demande à l’écran une actualisation de la météo actuelle, avec secours automatique Open-Meteo. Réinitialise la temporisation locale Tomorrow.io ; les quotas du service restent applicables. La météo et le vent sont actualisés à :01 et :31 ; les prévisions à :01. À utiliser avec parcimonie.",
+  "weather.attribution.data": "Météo : {providers}",
+  "weather.attribution.icons": "Icônes : Tomorrow.io",
+  "weather.providers_unavailable": "Services météo indisponibles - nouvelle tentative automatique"
 }
