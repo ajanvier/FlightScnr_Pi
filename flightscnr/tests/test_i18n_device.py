@@ -60,6 +60,18 @@ class I18nDeviceTests(unittest.TestCase):
         )
         self.assertTrue(next(item for item in items if item["id"] == "nl")["selected"])
 
+    def test_atc_and_basemap_labels_follow_language_switch(self):
+        from display.round_touch import settings
+        from display.round_touch.screens import info
+        from i18n import activate, tr
+
+        for language in ("fr", "de", "hu"):
+            activate(language)
+            self.assertEqual(settings.map_style_option_label("dark"), tr("portal.radar.map_style.dark_carto"))
+            self.assertEqual(info._atc_status_label_from_status({"state": "Playing"}),
+                             tr("settings.atc.status", value=tr("portal.atc.state.playing")))
+
+
     def test_language_picker_selects_effective_pack_for_regional_tag(self):
         from display.round_touch import settings
         from display.round_touch.screens import info
