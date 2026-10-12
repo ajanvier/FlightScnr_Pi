@@ -3963,7 +3963,14 @@ function renderBluetoothStatus(st) {
     if (!line) return;
     const name = st.name || st.mac || "";
     let text = i18nFormat("portal.common.status.value", "Status: {status}", {
-        status: i18nFromSource(st.state || "—"),
+        status: i18nText({
+            "Unavailable": "portal.bluetooth.state.unavailable",
+            "Adapter off": "portal.bluetooth.state.adapter_off",
+            "Connected": "portal.bluetooth.state.connected",
+            "Connected (no sink)": "portal.bluetooth.state.no_sink",
+            "Paired": "portal.bluetooth.state.paired",
+            "Not paired": "portal.bluetooth.state.not_paired",
+        }[st.state], st.state || "—"),
     });
     if (name) text += ` — ${name}`;
     if (st.mac && st.name) text += ` (${st.mac})`;

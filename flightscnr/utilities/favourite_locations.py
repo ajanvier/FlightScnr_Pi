@@ -391,10 +391,10 @@ def lookup_icao(code: str) -> dict:
 
     code = (code or "").strip().upper()
     if not code or not _ICAO_RE.match(code):
-        raise ValueError("Enter a 3–4 character ICAO or IATA code")
+        raise ValueError(tr("portal.validation.airport_code"))
     rec = get_airport_coords(code)
     if not rec or "lat" not in rec or "lon" not in rec:
-        raise ValueError(f"Airport code {code} not found")
+        raise ValueError(tr("portal.validation.airport_missing", code=code))
     name = (rec.get("name") or get_airport_name(code) or code).strip()
     icao = (rec.get("ident") or code).strip().upper()
     if len(icao) == 3:
@@ -418,7 +418,7 @@ def add_location(
     global _state
     reload()
     if len(_state["locations"]) >= MAX_FAVOURITES:
-        raise ValueError(f"Maximum of {MAX_FAVOURITES} favourite locations")
+        raise ValueError(tr("portal.validation.favourites_max", count=MAX_FAVOURITES))
     entry = _normalize_entry(
         {
             "id": uuid.uuid4().hex[:10],
@@ -429,13 +429,13 @@ def add_location(
         }
     )
     if entry is None:
-        raise ValueError("Invalid location name or coordinates")
+        raise ValueError(tr("portal.validation.location"))
     for existing in _state["locations"]:
         if (
             abs(existing["lat"] - entry["lat"]) < 1e-4
             and abs(existing["lon"] - entry["lon"]) < 1e-4
         ):
-            raise ValueError("A favourite already exists at that position")
+            raise ValueError(tr("portal.validation.duplicate_favourite"))
     _state["locations"].append(entry)
     _save(_state)
     _refresh_mtime()
