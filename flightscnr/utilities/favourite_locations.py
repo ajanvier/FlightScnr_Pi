@@ -54,6 +54,36 @@ def _default_state() -> dict:
     }
 
 
+_PROFILE_MODES = ("aircraft", "marine", "both")
+
+
+def _normalize_profile(raw) -> dict | None:
+    """Range, altitude band, and traffic mode saved with a place.
+
+    Unknown keys are dropped. An empty result means the place has no
+    profile and a switch should leave the live radar settings alone.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    if "scale_index" in raw:
+        try:
+            out["scale_index"] = int(raw["scale_index"])
+        except (TypeError, ValueError):
+            pass
+    for key in ("min_height_ft", "max_height_ft"):
+        if key not in raw:
+            continue
+        try:
+            out[key] = int(raw[key])
+        except (TypeError, ValueError):
+            pass
+    mode = str(raw.get("traffic_mode") or "").strip().lower()
+    if mode in _PROFILE_MODES:
+        out["traffic_mode"] = mode
+    return out or None
+
+
 def _normalize_home(raw) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -64,7 +94,11 @@ def _normalize_home(raw) -> dict | None:
         return None
     if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
         return None
-    return {"lat": lat, "lon": lon}
+    home = {"lat": lat, "lon": lon}
+    profile = _normalize_profile(raw.get("profile"))
+    if profile:
+        home["profile"] = profile
+    return home
 
 
 def _save(state: dict) -> None:
@@ -101,13 +135,17 @@ def _normalize_entry(raw) -> dict | None:
     if icao and not _ICAO_RE.match(icao):
         icao = ""
     entry_id = str(raw.get("id") or "").strip() or uuid.uuid4().hex[:10]
-    return {
+    entry = {
         "id": entry_id,
         "name": name,
         "icao": icao,
         "lat": lat,
         "lon": lon,
     }
+    profile = _normalize_profile(raw.get("profile"))
+    if profile:
+        entry["profile"] = profile
+    return entry
 
 
 def _load() -> dict:
@@ -271,8 +309,63 @@ def set_home(lat: float, lon: float) -> None:
     """Persist Home (portal / explicit Save as Home)."""
     global _state
     reload()
-    _state["home"] = {"lat": float(lat), "lon": float(lon)}
+    prev = _state.get("home") if isinstance(_state.get("home"), dict) else {}
+    home = {"lat": float(lat), "lon": float(lon)}
+    profile = _normalize_profile(prev.get("profile"))
+    if profile:
+        home["profile"] = profile
+    _state["home"] = home
     _state["active_index"] = HOME_INDEX
+    _save(_state)
+    _refresh_mtime()
+
+
+def active_profile() -> dict | None:
+    """Saved radar setup for the active Home or favourite, or None.
+
+    A custom center is not a saved place. No profile means the caller
+    should leave the current range, altitude band, and traffic mode.
+    """
+    reload()
+    idx = active_index()
+    if idx == CUSTOM_INDEX:
+        return None
+    if idx == HOME_INDEX:
+        home = _state.get("home")
+        raw = home.get("profile") if isinstance(home, dict) else None
+    else:
+        raw = _state["locations"][idx].get("profile")
+    profile = _normalize_profile(raw)
+    return dict(profile) if profile else None
+
+
+def remember_profile(updates: dict) -> None:
+    """Merge radar settings onto the active Home or favourite.
+
+    No-op for a custom center. Only range, altitude, and traffic mode
+    are kept.
+    """
+    global _state
+    cleaned = _normalize_profile(updates)
+    if not cleaned:
+        return
+    reload()
+    idx = active_index()
+    if idx == CUSTOM_INDEX:
+        return
+    if idx == HOME_INDEX:
+        _ensure_home_seeded()
+        home = _state.get("home")
+        if not isinstance(home, dict):
+            return
+        current = _normalize_profile(home.get("profile")) or {}
+        current.update(cleaned)
+        home["profile"] = current
+    else:
+        loc = _state["locations"][idx]
+        current = _normalize_profile(loc.get("profile")) or {}
+        current.update(cleaned)
+        loc["profile"] = current
     _save(_state)
     _refresh_mtime()
 

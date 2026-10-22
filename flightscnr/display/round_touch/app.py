@@ -3065,6 +3065,8 @@ class RoundTouchDisplay:
         from config import set_location_home
         from display.round_touch import weather_data
 
+        settings.apply_active_location_profile()
+        scale.select(settings.scale_index())
         set_location_home(lat, lon)
         map_bg.invalidate()
         map_bg.prewarm_all_scales()

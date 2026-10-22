@@ -649,6 +649,11 @@ def favourites_select():
         try:
             from display.round_touch import settings as display_settings
 
+            try:
+                display_settings.apply_active_location_profile()
+                entry = favourite_locations.active_favorite() or entry
+            except Exception:
+                print("Location profile apply after favourite select failed")
             display_settings.request_reload()
         except Exception:
             pass
