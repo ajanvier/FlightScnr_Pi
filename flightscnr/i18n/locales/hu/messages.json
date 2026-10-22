@@ -471,7 +471,7 @@
   "portal.api_keys.not_set": "Nincs beállítva",
   "portal.position_sources.min_radius.with_unit": "Követés minimális sugara ({unit})",
   "portal.position_sources.max_radius.with_unit": "Követés maximális sugara ({unit})",
-  "portal.position_sources.min_radius.dynamic_hint": "A sebességalapú nagyítási görbe alsó korlátja (nem a {taxi_speed} {unit} alatti gurulási rögzítésé, amely kb. {taxi_distance} {unit} marad). Alapértelmezés: {default_min} {unit}.",
+  "portal.position_sources.min_radius.dynamic_hint": "A sebességalapú nagyítási görbe alsó korlátja (nem a {taxi_speed} alatti gurulási rögzítésé, amely kb. {taxi_distance} {unit} marad). Alapértelmezés: {default_min} {unit}.",
   "portal.position_sources.max_radius.dynamic_hint": "A Követés nagyításának felső korlátja utazó-/nagy sebességnél. Alapértelmezés: {default_max} {unit}.",
   "portal.radar.vessel_min_speed.with_unit": "Hajók minimális sebessége ({unit})",
   "portal.radar.aircraft_min_speed.with_unit": "Repülőgépek minimális sebessége ({unit})",
