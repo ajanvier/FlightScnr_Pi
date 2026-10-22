@@ -1605,25 +1605,48 @@ def max_height_ft() -> int:
     return _snap_max_height(_state.get("max_height_ft", 100000))
 
 
+def _remember_location_profile(**fields) -> None:
+    """Store radar knobs on the active Home or favourite, when one is selected."""
+    if not fields:
+        return
+    try:
+        from utilities import favourite_locations
+
+        favourite_locations.remember_profile(fields)
+    except Exception:
+        logger.debug("Could not store location profile", exc_info=True)
+
+
+def _remember_min_height(before_max) -> None:
+    fields = {"min_height_ft": _state["min_height_ft"]}
+    if _state.get("max_height_ft") != before_max:
+        fields["max_height_ft"] = _state["max_height_ft"]
+    _remember_location_profile(**fields)
+
+
 def cycle_min_height():
     clear_min_height_override()
     opts = MIN_HEIGHT_OPTIONS
     current = min_height_ft()
     idx = opts.index(current) if current in opts else 0
+    before_max = _state.get("max_height_ft")
     _state["min_height_ft"] = opts[(idx + 1) % len(opts)]
     _ensure_height_band()
     _sync_config_min_height()
     _sync_config_max_height()
     _save(_state)
+    _remember_min_height(before_max)
 
 
 def set_min_height_ft(value: int):
     clear_min_height_override()
+    before_max = _state.get("max_height_ft")
     _state["min_height_ft"] = _snap_min_height(value)
     _ensure_height_band()
     _sync_config_min_height()
     _sync_config_max_height()
     _save(_state)
+    _remember_min_height(before_max)
 
 
 def cycle_max_height():
@@ -1638,6 +1661,7 @@ def cycle_max_height():
     _ensure_height_band()
     _sync_config_max_height()
     _save(_state)
+    _remember_location_profile(max_height_ft=_state["max_height_ft"])
 
 
 def set_max_height_ft(value: int):
@@ -1646,6 +1670,7 @@ def set_max_height_ft(value: int):
     _sync_config_min_height()
     _sync_config_max_height()
     _save(_state)
+    _remember_location_profile(max_height_ft=_state["max_height_ft"])
 
 
 _sync_config_min_height()
@@ -2415,6 +2440,7 @@ def set_traffic_mode(mode: str):
     _state["ais_enabled"] = raw in ("marine", "both")
     _save(_state)
     _sync_ais_client()
+    _remember_location_profile(traffic_mode=raw)
 
 
 def toggle_ais_enabled():
@@ -2712,6 +2738,33 @@ def set_scale_index(index: int):
 
     _state["scale_index"] = max(0, min(int(index), len(scale.SCALE_BANDS) - 1))
     _save(_state)
+    _remember_location_profile(scale_index=_state["scale_index"])
+
+
+def apply_active_location_profile() -> bool:
+    """Copy the active place's saved radar setup into the live settings.
+
+    Returns False when that place has no profile: a custom center, or a
+    favourite saved before profiles existed. The runtime altitude floor is
+    cleared whenever a profile is applied, so the previous place's
+    auto-floor does not carry over.
+    """
+    from utilities import favourite_locations
+
+    profile = favourite_locations.active_profile()
+    if not profile:
+        return False
+    if "max_height_ft" in profile:
+        set_max_height_ft(int(profile["max_height_ft"]))
+    if "min_height_ft" in profile:
+        set_min_height_ft(int(profile["min_height_ft"]))
+    else:
+        clear_min_height_override()
+    if "traffic_mode" in profile:
+        set_traffic_mode(str(profile["traffic_mode"]))
+    if "scale_index" in profile:
+        set_scale_index(int(profile["scale_index"]))
+    return True
 
 
 def cycle_scale():
