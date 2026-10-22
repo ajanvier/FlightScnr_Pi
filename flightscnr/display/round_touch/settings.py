@@ -80,12 +80,13 @@ TRAFFIC_MODE_LABELS = {
     "both": "settings.opt.traffic_mode.both",
 }
 # Callsign / vessel-name tags next to radar icons.
-TRAFFIC_LABEL_MODES = ("aircraft", "marine", "both", "off")
+TRAFFIC_LABEL_MODES = ("aircraft", "marine", "both", "off", "tap")
 TRAFFIC_LABEL_LABELS = {
     "aircraft": "settings.opt.traffic_label.aircraft",
     "marine": "settings.opt.traffic_label.marine",
     "both": "settings.opt.traffic_label.both",
     "off": "settings.opt.traffic_label.off",
+    "tap": "settings.opt.traffic_label.tap",
 }
 # Radar aircraft identity line: marketing flight number, ATC callsign, tail, or
 # time-alternating through whichever of those differ.
@@ -97,7 +98,9 @@ AIRCRAFT_TAG_ID_LABELS = {
     "alternate": "settings.opt.tag_id.alternate",
 }
 # Seconds between identity swaps when aircraft_tag_id == alternate.
-AIRCRAFT_TAG_ID_ALTERNATE_S = 2.5
+# Long enough to read a tail number; 2.5s flipped the whole tag row before
+# the previous identity could be read.
+AIRCRAFT_TAG_ID_ALTERNATE_S = 5.0
 # Split-flap board row identity: tail number, marketing flight, or ATC callsign.
 FLIP_BOARD_ID_MODES = ("tail", "flight_number", "callsign")
 FLIP_BOARD_ID_LABELS = {
@@ -106,8 +109,9 @@ FLIP_BOARD_ID_LABELS = {
     "callsign": "settings.opt.flip_id.callsign",
 }
 # Out-of-range aircraft on the radar rim (PR118).
-RIM_TARGET_STYLES = ("plane", "dot")
+RIM_TARGET_STYLES = ("glide", "plane", "dot")
 RIM_TARGET_STYLE_LABELS = {
+    "glide": "settings.opt.rim.glide",
     "plane": "settings.opt.rim.plane",
     "dot": "settings.opt.rim.dot",
 }
@@ -356,6 +360,7 @@ _defaults = {
     "flip_board_sound": True,
     # Hockey-stick underline + diagonal from tag to blip.
     "show_tag_leaders": True,
+    "hud_tap_labels": False,
     # Out-of-range rim targets: plane | dot (PR118). Seeded from config on first load.
     "rim_target_style": "plane",
     # Follow speed-based zoom (issue #114) — seeded from config on first load.
@@ -392,6 +397,11 @@ _defaults = {
     "tag_text_light_rgb": list(color_presets.DEFAULT_TAG_TEXT_LIGHT_RGB),
     "theme_palette_v": color_presets.THEME_PALETTE_V,
     "clock_12hr": True,
+    # Per-frame aircraft icons. Off keeps icons baked into the radar layer.
+    "smooth_motion": False,
+    # off | selected (tracked / last tapped flight) | all — speed-coloured flight trails.
+    "flight_trails": "off",
+    "flight_trail_seconds": 120,
     # Requested UI language. Missing/invalid packs resolve to English at runtime.
     "display_language": "en",
     # us | eu — digital and altimeter clock date order (Flieger unchanged).
@@ -1298,6 +1308,9 @@ def _settings_snapshot(state: dict) -> tuple:
         state.get("color_by_altitude"),
         state.get("show_aircraft_tag"),
         state.get("traffic_labels"),
+        bool(state.get("hud_tap_labels", False)),
+        bool(state.get("smooth_motion", False)),
+        str(state.get("rim_target_style") or "plane"),
         state.get("aircraft_tag_id"),
         _normalize_facing(state.get("facing_deg", 0)),
         state.get("show_sweep"),
@@ -1325,6 +1338,8 @@ def _settings_snapshot(state: dict) -> tuple:
         state.get("flight_detail_timeout_s"),
         state.get("clock_timeout_s"),
         state.get("clock_12hr"),
+        str(state.get("flight_trails") or "off"),
+        state.get("flight_trail_seconds"),
         str(state.get("display_language") or "en"),
         str(state.get("date_format") or "us"),
         state.get("auto_timezone"),
@@ -2482,6 +2497,46 @@ def set_rim_target_style(value: str):
     _save(_state)
 
 
+_LIVE_ICONS_OFF = {"0", "false", "off", "no"}
+_LIVE_ICONS_ON = {"1", "true", "on", "yes"}
+
+
+def _live_icons_env() -> bool | None:
+    """FLIGHTSCNR_LIVE_ICONS override, or None when unset or unrecognized."""
+    raw = os.environ.get("FLIGHTSCNR_LIVE_ICONS")
+    if raw is None or not str(raw).strip():
+        return None
+    value = str(raw).strip().lower()
+    if value in _LIVE_ICONS_OFF:
+        return False
+    if value in _LIVE_ICONS_ON:
+        return True
+    return None
+
+
+def smooth_motion_setting() -> bool:
+    """Saved Smooth motion switch. The environment variable can still override it."""
+    return bool(_state.get("smooth_motion", False))
+
+
+def smooth_motion_enabled() -> bool:
+    """True when aircraft icons are drawn every frame instead of baked in."""
+    override = _live_icons_env()
+    if override is not None:
+        return override
+    return smooth_motion_setting()
+
+
+def set_smooth_motion(enabled: bool) -> bool:
+    _state["smooth_motion"] = bool(enabled)
+    _save(_state)
+    return smooth_motion_setting()
+
+
+def toggle_smooth_motion() -> bool:
+    return set_smooth_motion(not smooth_motion_setting())
+
+
 def show_range_rings() -> bool:
     return bool(_state.get("show_range_rings", True))
 
@@ -2514,11 +2569,38 @@ def traffic_labels_label() -> str:
 
 
 def show_aircraft_labels() -> bool:
-    return traffic_labels() in ("aircraft", "both")
+    return traffic_labels() in ("aircraft", "both", "tap")
 
 
 def show_marine_labels() -> bool:
-    return traffic_labels() in ("marine", "both")
+    return traffic_labels() in ("marine", "both", "tap")
+
+
+def hud_tap_labels() -> bool:
+    """Tap on the radar HUD pill toggles tags between always-on and tap mode."""
+    return bool(_state.get("hud_tap_labels", False))
+
+
+def set_hud_tap_labels(enabled: bool) -> None:
+    _state["hud_tap_labels"] = bool(enabled)
+    _save(_state)
+
+
+def labels_full_mode() -> str:
+    """Label mode to return to when leaving tap mode, including off."""
+    mode = str(_state.get("labels_full_mode") or "both").strip().lower()
+    return mode if mode in ("aircraft", "marine", "both", "off") else "both"
+
+
+def set_labels_full_mode(mode: str) -> None:
+    if mode in ("aircraft", "marine", "both", "off"):
+        _state["labels_full_mode"] = mode
+        _save(_state)
+
+
+def tap_labels_mode() -> bool:
+    """True when tags show only for targets the user tapped."""
+    return traffic_labels() == "tap"
 
 
 def cycle_traffic_labels():
@@ -2785,6 +2867,43 @@ def set_use_12hr_clock(enabled: bool) -> bool:
     value = bool(enabled)
     _state["clock_12hr"] = value
     _save(_state)
+    return value
+
+
+FLIGHT_TRAIL_MODES = ("off", "selected", "all")
+FLIGHT_TRAIL_SECONDS_CHOICES = (30, 60, 120, 300, 600)
+FLIGHT_TRAIL_SECONDS_DEFAULT = 120
+
+
+def flight_trail_seconds() -> int:
+    """How long a trail stays on the radar before it has faded away."""
+    try:
+        value = int(float(_state.get("flight_trail_seconds", FLIGHT_TRAIL_SECONDS_DEFAULT)))
+    except (TypeError, ValueError):
+        return FLIGHT_TRAIL_SECONDS_DEFAULT
+    return max(10, min(1800, value))
+
+
+def set_flight_trail_seconds(value) -> int:
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        seconds = FLIGHT_TRAIL_SECONDS_DEFAULT
+    seconds = max(10, min(1800, seconds))
+    _rmw_save({"flight_trail_seconds": seconds})
+    return seconds
+
+
+def flight_trails_mode() -> str:
+    value = str(_state.get("flight_trails", "off") or "off").lower()
+    return value if value in FLIGHT_TRAIL_MODES else "off"
+
+
+def set_flight_trails_mode(mode: str) -> str:
+    value = str(mode or "").lower()
+    if value not in FLIGHT_TRAIL_MODES:
+        value = "off"
+    _rmw_save({"flight_trails": value})
     return value
 
 

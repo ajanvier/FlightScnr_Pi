@@ -82,8 +82,7 @@ def enu_to_screen(dx_km: float, dy_km: float, facing_deg: float | None = None):
 def fetch_max_km():
     """Max ground distance for aircraft fetch and rim blips."""
     band = scale.active_band()
-    screen_r = theme.VISIBLE_RADIUS - theme.BEYOND_RING_MARGIN
-    return band["coverage_km"] * (screen_r / theme.GRID_OUTER_RADIUS)
+    return band["coverage_km"] * (scale.fetch_screen_radius() / theme.GRID_OUTER_RADIUS)
 
 
 def visible_max_km():
@@ -132,6 +131,30 @@ def lat_lon_to_screen(lat: float, lon: float):
             pass
     dx_km, dy_km, _ = local_offset_km(lat, lon)
     return enu_to_screen(dx_km, dy_km)
+
+
+def lat_lon_to_screen_f(lat: float, lon: float):
+    """Like ``lat_lon_to_screen`` but with sub-pixel (float) precision."""
+    if _use_basemap_projection():
+        try:
+            from display.round_touch import map_bg
+
+            pos = map_bg.lat_lon_to_basemap_screen(
+                lat,
+                lon,
+                center_lat=LOCATION_HOME[0],
+                center_lon=LOCATION_HOME[1],
+                as_float=True,
+            )
+            if pos is not None:
+                return pos
+        except Exception:
+            pass
+    dx_km, dy_km, _ = local_offset_km(lat, lon)
+    rdx, rdy = rotate_offset(dx_km, dy_km, settings.effective_facing_deg())
+    outer_km = scale.active_band()["label_km"]
+    px_per_km = theme.GRID_OUTER_RADIUS / outer_km
+    return theme.CENTER_X + rdx * px_per_km, theme.CENTER_Y - rdy * px_per_km
 
 
 def screen_to_lat_lon(x: float, y: float, center_lat=None, center_lon=None):

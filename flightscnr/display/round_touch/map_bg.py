@@ -1322,6 +1322,7 @@ def lat_lon_to_basemap_screen(
     *,
     center_lat: float | None = None,
     center_lon: float | None = None,
+    as_float: bool = False,
 ) -> tuple[int, int] | None:
     """Map WGS84 → radar pixels using the same Mercator math as the basemap.
 
@@ -1381,6 +1382,8 @@ def lat_lon_to_basemap_screen(
         # pixel space: east (+x) goes to screen-up (−y). Math CCW would send
         # east down and leave icons 180° off the map (issue #92).
         vx, vy = vx * cos_a + vy * sin_a, -vx * sin_a + vy * cos_a
+    if as_float:
+        return (theme.CENTER_X + vx, theme.CENTER_Y + vy)
     return (
         theme.CENTER_X + int(round(vx)),
         theme.CENTER_Y + int(round(vy)),

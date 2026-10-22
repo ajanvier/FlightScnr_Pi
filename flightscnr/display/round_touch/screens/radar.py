@@ -10,6 +10,7 @@
 """Radar screen — FlightScnr-style sweep and aircraft markers."""
 
 import math
+import os
 import threading
 import time
 
@@ -65,7 +66,31 @@ _ALERT_GLOW_RIM_DOT_SCALE = 1.55
 # redrawing every icon and tag costs ~6–20ms, so aircraft refresh at ~5Hz —
 # still smooth for traffic, and halves worker SDL/GIL contention vs the
 # original 10Hz cadence when ADS-B grabs every 2s.
-_FRAME_LAYER_TTL_S = 0.2
+# When Smooth motion is on, aircraft icons are drawn live every frame (see
+# ``live_icon_frame``) and the baked layer can refresh more slowly.
+def live_icons_enabled() -> bool:
+    return settings.smooth_motion_enabled()
+
+
+def _configured_layer_ttl() -> float:
+    raw = os.environ.get("FLIGHTSCNR_LAYER_TTL")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    if not live_icons_enabled():
+        return 0.2
+    # Icons, tags, and halos already move every frame. Rebuilding this base
+    # just to rotate it is what makes the sweep hitch. Trails are the baked
+    # piece that still ages; a live line covers the gap until the next bake.
+    if settings.flight_trails_mode() != "off":
+        # The live connector covers the gap. Baking every trail once a second
+        # holds the draw lock long enough for the beam to skip.
+        return 4.0
+    return 3.0
+
+
 # Smoothed cost of recent rebuilds. Dense AIS+ADS-B can push a rebuild past
 # 50ms of GIL/SDL time; back off only then so the worker doesn't monopolize
 # the GIL. Decay toward the base TTL so a single cold-cache rebuild (icon
@@ -74,16 +99,21 @@ _layer_build_cost_s = 0.0
 
 
 # Dense AIS+ADS-B rebuilds can cost 50–150ms; without a ceiling, cost*3 would
-# push refresh toward multi-second freezes. Cap so markers still coast ≥2Hz.
+# push refresh toward multi-second freezes. Cap so baked markers still coast
+# ≥2Hz. Live icons don't need that — the cap would force a full rotate and
+# flip several times a second and chop the beam.
 _FRAME_LAYER_TTL_MAX_S = 0.5
+_LIVE_LAYER_TTL_MAX_S = 4.0
 
 
 def _layer_ttl_s() -> float:
-    ttl = max(_FRAME_LAYER_TTL_S, _layer_build_cost_s * 3.0)
-    ttl = min(ttl, _FRAME_LAYER_TTL_MAX_S)
+    ttl = max(_configured_layer_ttl(), _layer_build_cost_s * 3.0)
+    cap = _LIVE_LAYER_TTL_MAX_S if live_icons_enabled() else _FRAME_LAYER_TTL_MAX_S
+    ttl = min(ttl, cap)
     # Rim pulse is ~2Hz; keep the baked stroke in sync without leaving the
-    # fast dirty-rect present path.
-    if aircraft_alert.rim_flash_active():
+    # fast dirty-rect present path. Live icons already move every frame, and
+    # an 0.12s rebuild pins the beam for the whole flash.
+    if aircraft_alert.rim_flash_active() and not live_icons_enabled():
         return min(ttl, 0.12)
     return ttl
 
@@ -222,15 +252,17 @@ def frame_layer_due() -> bool:
     """True when the ~10Hz aircraft layer wants a rebuild before the next frame."""
     if _rim_baked_in_layer and not aircraft_alert.rim_flash_active():
         return True
-    # Tracked / alert icons blink ~2Hz; rebuild on the phase flip so the
-    # halo stays in lockstep with the pulse (TTL alone can skip a beat).
-    if _alert_glow_in_layer and aircraft_alert.pulse_phase() != _layer_pulse_phase:
-        return True
-    if _heli_rotor_in_layer:
-        from display.round_touch import aircraft_type_icons
-
-        if aircraft_type_icons.rotor_anim_tick() != _layer_rotor_tick:
+    # In-range halos and rotors are live sprites. Rebuilding the map on the
+    # alert pulse (~4Hz) or the rotor tick (~5Hz) stalls the beam. Baked
+    # icons still need that rebuild so their pulse stays in step.
+    if not live_icons_enabled():
+        if _alert_glow_in_layer and aircraft_alert.pulse_phase() != _layer_pulse_phase:
             return True
+        if _heli_rotor_in_layer:
+            from display.round_touch import aircraft_type_icons
+
+            if aircraft_type_icons.rotor_anim_tick() != _layer_rotor_tick:
+                return True
     return _frame_layer is None or (
         time.time() - _frame_layer_at
     ) >= _layer_ttl_s() - theme.SWEEP_FRAME_MS / 1000.0
@@ -261,6 +293,7 @@ def _publish_frame_layer(build: pygame.Surface, key, *, rim_baked: bool = False)
     _frame_layer_at = time.time()
     _frame_layer_gen += 1
     _rim_baked_in_layer = bool(rim_baked)
+    _publish_live_specs()
     if (
         _layer_cooling is not None
         and _layer_cooling.get_size() == (theme.SIZE, theme.SIZE)
@@ -287,7 +320,10 @@ def _build_frame_layer(build: pygame.Surface, backdrop, flights, offset) -> bool
     wildfire_overlay.draw_fires(build, pan_offset=offset)
     earthquake_overlay.draw_quakes(build, pan_offset=offset)
     _t = _rebuild_stage("2r_fires", _t)
-    _draw_flights(build, flights)
+    _building_icons = [] if live_icons_enabled() else None
+    _building_labels = [] if live_icons_enabled() else None
+    _draw_flights(build, flights, live=_building_icons, live_labels=_building_labels)
+    _set_pending_live_specs(_building_icons, _building_labels)
     _t = _rebuild_stage("2r_flights", _t)
     _draw_status(build, flights)
     _draw_map_attribution(build)
@@ -541,6 +577,7 @@ def draw_radar(
             except pygame.error as exc:
                 if "locked" not in str(exc).lower():
                     raise
+            draw_live_icons(surface)
             bezel_applied = True
         _draw_pan_commit_overlay(surface)
     else:
@@ -556,6 +593,7 @@ def draw_radar(
             except pygame.error as exc:
                 if "locked" not in str(exc).lower():
                     raise
+            draw_live_icons(surface)
             # Pill is no longer baked into the layer — draw full HUD + popover.
             radar_hud.draw_hud(surface, include_popover=True, draw_pill=True)
             from display.round_touch import update_bubble
@@ -1119,8 +1157,70 @@ def _label_priority(flight, x: int, y: int) -> tuple:
     )
 
 
-def _draw_labels(surface, inner_items, blips):
+# --- "tap" label mode: tags only for targets the user tapped -------------
+_MAX_PINS = 12
+_pinned: list[str] = []
+_label_hits: list[tuple[str, pygame.Rect]] = []
+
+
+def _pin_id(flight) -> str:
+    try:
+        from display.round_touch import position_smooth
+
+        ident = position_smooth.identity_of(flight)
+    except Exception:
+        ident = None
+    return ident or _label_key(flight)
+
+
+def is_label_pinned(flight) -> bool:
+    return _pin_id(flight) in _pinned
+
+
+def pin_label(flight) -> None:
+    ident = _pin_id(flight)
+    if ident not in _pinned:
+        _pinned.append(ident)
+        del _pinned[:-_MAX_PINS]
+        invalidate_frame_layer()
+
+
+def toggle_label_pin(flight) -> bool:
+    """Show the tag when hidden, hide it when shown. True when now shown."""
+    ident = _pin_id(flight)
+    if ident in _pinned:
+        _pinned.remove(ident)
+        shown = False
+    else:
+        _pinned.append(ident)
+        del _pinned[:-_MAX_PINS]
+        shown = True
+    invalidate_frame_layer()
+    return shown
+
+
+def clear_pinned_labels() -> bool:
+    """Hide all tapped tags; True when something was visible."""
+    if not _pinned:
+        return False
+    _pinned.clear()
+    _label_hits.clear()
+    invalidate_frame_layer()
+    return True
+
+
+def label_hit_id(x, y) -> str | None:
+    """Identity of the pinned tag under a tap, if any."""
+    for ident, rect in reversed(_label_hits):
+        if rect.collidepoint(x, y):
+            return ident
+    return None
+
+
+def _draw_labels(surface, inner_items, blips, live_ids=None, live_labels=None):
     """Measure every tag, solve slots once, then draw at the assigned boxes."""
+    if settings.tap_labels_mode():
+        inner_items = [it for it in inner_items if _pin_id(it[1]) in _pinned]
     targets = []
     prepared = {}
     for _dist, flight, (x, y) in inner_items:
@@ -1133,7 +1233,8 @@ def _draw_labels(surface, inner_items, blips):
             continue
         head = rows[0][0]
         key = _label_key(flight)
-        prepared[key] = (flight, x, y, rows)
+        sig_text = tuple((t, tuple(c[:3])) for t, c, _f, _y in lines if t)
+        prepared[key] = (flight, x, y, rows, sig_text)
         targets.append(
             label_layout.Target(
                 key=key,
@@ -1161,21 +1262,48 @@ def _draw_labels(surface, inner_items, blips):
         place = placements.get(target.key)
         if place is None or place.rect is None:
             continue
-        flight, x, y, rows = prepared[target.key]
+        flight, x, y, rows, sig_text = prepared[target.key]
         if place.tier == label_layout.TIER_SHORT:
             rows = rows[:1]
         on_right = label_layout.SLOTS[place.slot][0]
-        _blit_tag_at(
-            surface,
-            x,
-            y,
-            rows,
-            place.rect,
-            on_right,
-            _flight_icon_color(flight, compact=False),
-            blips,
-            drawn,
-        )
+        leader_color = _flight_icon_color(flight, compact=False)
+        live_id = None
+        if live_ids:
+            from display.round_touch import position_smooth
+
+            live_id = position_smooth.identity_of(flight)
+            if live_id not in live_ids:
+                live_id = None
+        if live_id is not None and live_labels is not None:
+            # Tag rides with its (live) icon: sprite built once, moved every frame.
+            sig = (
+                sig_text, place.tier, on_right, tuple(leader_color[:3]),
+                place.rect.size, (place.rect.left - x, place.rect.top - y),
+                settings.show_tag_leaders(),
+            )
+            lb = _label_state.get(live_id)
+            if lb is None or lb.get("sig") != sig:
+                vis, off = _make_label_vis(
+                    x, y, rows, place.rect, on_right, leader_color, leader_color
+                )
+                if lb is None:
+                    lb = _label_state[live_id] = {"id": live_id}
+                lb["off"] = off
+                lb["sig"] = sig
+                lb["vis"] = vis
+            live_labels.append(lb)
+        else:
+            _blit_tag_at(
+                surface,
+                x,
+                y,
+                rows,
+                place.rect,
+                on_right,
+                leader_color,
+                blips,
+                drawn,
+            )
         drawn.append(place.rect)
 
 
@@ -1193,6 +1321,375 @@ def _visible_flights(flights, *, min_height_ft: int | None = None):
             continue
         visible.append(f)
     return visible
+
+
+# --- Live (per-frame) aircraft icons and tags ---------------------------------
+# Icons and their tags are drawn every frame from the smoothed positions, not
+# baked into the slowly refreshed layer. Specs are persistent per aircraft so the
+# rendered sprites and their sub-pixel variants survive layer rebuilds.
+_live_icons: list = []
+_live_labels: list = []
+_live_pending: tuple[list, list, dict] | None = None
+# Trail head of each aircraft as baked into the current layer:
+# {identity: ((x, y), rgb, width)} — the live frame extends it to the live icon.
+_trail_heads_building: dict = {}
+_live_heads: dict = {}
+# Live trail tips for this frame: (x0, y0, x1, y1, rgba, width) in logical
+# pixels. Drawn as lines under the sweep, not as a new sprite every frame.
+_live_connectors: list = []
+_icon_state: dict = {}
+_label_state: dict = {}
+
+
+def _set_pending_live_specs(icons, labels) -> None:
+    global _live_pending
+    if icons is None:
+        _live_pending = ([], [], {})
+    else:
+        _live_pending = (icons, labels, dict(_trail_heads_building))
+
+
+def _publish_live_specs() -> None:
+    global _live_icons, _live_labels, _live_heads
+    if _live_pending is not None:
+        _live_icons, _live_labels, _live_heads = _live_pending
+
+
+def _prune_live_state(icons: list) -> None:
+    keep = {st["id"] for st in icons}
+    for table in (_icon_state, _label_state):
+        for key in [k for k in table if k not in keep]:
+            del table[key]
+
+
+_SUBPX = 4          # sub-pixel steps per pixel (quarter-pixel positioning)
+_PHASE_BUDGET = 10  # max new sub-pixel variants rendered per frame
+_phase_left = _PHASE_BUDGET
+
+
+def _icon_kind(st) -> str:
+    """Glyph identity. A heading-only cache would keep the previous type."""
+    flight = st.get("flight") or {}
+    try:
+        from display.round_touch import aircraft_type_icons
+
+        cat = aircraft_type_icons.icon_category(flight)
+    except Exception:
+        cat = ""
+    plane = flight.get("plane") or flight.get("aircraft_type") or flight.get("aircraft_code") or ""
+    return f"{flight.get('kind') or ''}:{cat}:{plane}"
+
+
+def _icon_vis(st, heading_screen: float):
+    """Icon sprite bundle, re-rendered only when the heading moved >= 2 degrees."""
+    vis = st.get("vis")
+    rotor = 0
+    if st.get("heli"):
+        from display.round_touch import aircraft_type_icons
+
+        rotor = aircraft_type_icons.rotor_anim_tick()
+    kind = _icon_kind(st)
+    if (
+        vis is not None
+        and vis["color"] == st["color"]
+        and vis.get("rotor", 0) == rotor
+        and vis.get("kind") == kind
+    ):
+        diff = abs(((heading_screen - vis["hdg"] + 180.0) % 360.0) - 180.0)
+        if diff < 2.0:
+            return vis
+    flight = st["flight"]
+    try:
+        pct = max(1.0, settings.target_size_pct(aircraft.target_category(flight)) / 100.0)
+    except Exception:
+        pct = 1.0
+    side = int(min(240, max(56, theme.s(34) * pct * 1.6)))
+    side += side % 2
+    sprite = pygame.Surface((side, side), pygame.SRCALPHA)
+    # Transparent pixels carry the icon colour so down-scaling the edges blends
+    # colour with colour (no dark fringe).
+    sprite.fill((*st["color"][:3], 0))
+    aircraft.draw_plane_icon(
+        sprite, side // 2, side // 2, heading_screen, st["color"], flight=flight
+    )
+    vis = {"sprite": sprite, "hdg": heading_screen, "color": st["color"],
+           "up": None, "phases": {}, "fill": tuple(st["color"][:3]), "rotor": rotor,
+           "kind": kind}
+    st["vis"] = vis
+    return vis
+
+
+def _subpixel_variant(vis, a: int, b: int):
+    """Sprite shifted right/down by a/_SUBPX, b/_SUBPX pixel (None if over budget)."""
+    global _phase_left
+    got = vis["phases"].get((a, b))
+    if got is not None:
+        return got
+    if _phase_left <= 0:
+        return None
+    _phase_left -= 1
+    sprite = vis["sprite"]
+    w, h = sprite.get_size()
+    pad = _SUBPX - 1
+    up = vis["up"]
+    if up is None:
+        big = pygame.transform.scale(sprite, (w * _SUBPX, h * _SUBPX))
+        up = pygame.Surface((w * _SUBPX + pad, h * _SUBPX + pad), pygame.SRCALPHA)
+        up.fill((*vis["fill"], 0))
+        up.blit(big, (pad, pad))
+        vis["up"] = up
+    window = pygame.Rect(pad - a, pad - b, w * _SUBPX, h * _SUBPX)
+    shifted = pygame.transform.smoothscale(up.subsurface(window), (w, h))
+    vis["phases"][(a, b)] = shifted
+    return shifted
+
+
+def _place_sprite(vis, fx: float, fy: float):
+    """Pick the sub-pixel variant for centre ``(fx, fy)``; returns (sprite, ix, iy)."""
+    ix, iy = int(math.floor(fx)), int(math.floor(fy))
+    a = min(_SUBPX - 1, int((fx - ix) * _SUBPX))
+    b = min(_SUBPX - 1, int((fy - iy) * _SUBPX))
+    sprite = vis["sprite"]
+    if a or b:
+        shifted = _subpixel_variant(vis, a, b)
+        if shifted is not None:
+            return shifted, ix, iy
+        return sprite, int(round(fx)), int(round(fy))
+    return sprite, ix, iy
+
+
+def _make_label_vis(x, y, rows, rect, on_right, leader_rgb, text_rgb):
+    """Render one tag (rows + hockey-stick leader) onto its own sprite.
+
+    Returns ``(vis, (offset_x, offset_y))`` where the offset is the sprite
+    centre relative to the icon position ``(x, y)``.
+    """
+    underline_w = rows[-1][0].get_width()
+    geo_pts = _tag_leader_geometry(x, y, rect, on_right, underline_w)
+    xs = [rect.left, rect.right]
+    ys = [rect.top, rect.bottom]
+    for seg in (geo_pts.get("stem"), geo_pts.get("underline")):
+        if seg:
+            for px, py in seg:
+                xs.append(px)
+                ys.append(py)
+    margin = 4
+    left, right = min(xs) - margin, max(xs) + margin
+    top, bottom = min(ys) - margin, max(ys) + margin
+    w, h = right - left, bottom - top
+    w += w % 2
+    h += h % 2
+    sprite = pygame.Surface((w, h), pygame.SRCALPHA)
+    sprite.fill((*text_rgb[:3], 0))
+    _blit_tag_at(
+        sprite, x - left, y - top, rows, rect.move(-left, -top),
+        on_right, leader_rgb, None, None,
+    )
+    vis = {"sprite": sprite, "up": None, "phases": {}, "fill": tuple(text_rgb[:3])}
+    return vis, (left + w / 2.0 - x, top + h / 2.0 - y)
+
+
+def _clip_to_display(sprite, ix, iy):
+    """Crop a sprite that straddles the round display edge (else unchanged)."""
+    w, h = sprite.get_size()
+    cx, cy = theme.CENTER_X, theme.CENTER_Y
+    r = theme.VISIBLE_RADIUS
+    far = math.hypot(abs(ix - cx) + w / 2.0, abs(iy - cy) + h / 2.0)
+    if far <= r:
+        return sprite, ix, iy
+    near = math.hypot(max(0.0, abs(ix - cx) - w / 2.0), max(0.0, abs(iy - cy) - h / 2.0))
+    if near >= r:
+        return pygame.Surface((1, 1), pygame.SRCALPHA), ix, iy
+    clipped = sprite.copy()
+    mask = pygame.Surface((w, h), pygame.SRCALPHA)
+    pygame.draw.circle(mask, (255, 255, 255, 255), (cx - (ix - w // 2), cy - (iy - h // 2)), r)
+    clipped.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    return clipped, ix, iy
+
+
+def _live_glow_sprite(flight, icon_color):
+    """Halo disc that rides with a live icon, or None."""
+    if not _blip_wants_glow(flight):
+        return None
+    style = _halo_style(flight, icon_color, aircraft_alert.pulse_phase())
+    if style is None:
+        return None
+    color, alpha, blooming = style
+    radius = _alert_glow_radius(flight, compact=False, blooming=blooming)
+    return draw.soft_glow_surface(radius, color, alpha)
+
+
+def live_trail_connectors() -> list:
+    """Trail tips published by the latest ``live_icon_frame`` (logical pixels)."""
+    return _live_connectors
+
+
+def live_icon_frame(now: float | None = None) -> list:
+    """Per-frame ``[(sprite, x, y), ...]`` for icons then tags (logical coords)."""
+    global _phase_left, _live_connectors
+    _live_connectors = []
+    icons = _live_icons
+    if not icons:
+        _label_hits.clear()
+        return []
+    from display.round_touch import position_smooth
+
+    _phase_left = _PHASE_BUDGET
+    smoother = position_smooth.active()
+    now = time.time() if now is None else now
+    out = []
+    glows: list = []
+    live_pos: dict = {}
+    for st in icons:
+        fx, fy = st["xy"]
+        heading = st["flight"].get("heading") or 0
+        pos = smoother.current(st["id"], now) if smoother is not None else None
+        if pos is not None:
+            lat, lon, hs = pos
+            try:
+                fx, fy = geo.lat_lon_to_screen_f(lat, lon)
+            except Exception:
+                pass
+            if hs is not None:
+                heading = hs
+        live_pos[st["id"]] = (fx, fy)
+        st["color"] = _flight_icon_color(st["flight"], compact=False)
+        glow = _live_glow_sprite(st["flight"], st.get("color"))
+        if glow is not None:
+            glows.append(_clip_to_display(glow, int(round(fx)), int(round(fy))))
+        head = _live_heads.get(st["id"])
+        if head is not None:
+            (bx, by), rgb, width = head
+            if math.hypot(fx - bx, fy - by) >= 0.75:
+                _live_connectors.append((
+                    float(bx), float(by), float(fx), float(fy),
+                    (*tuple(rgb[:3]), _TRAIL_ALPHA),
+                    int(max(1, width)),
+                ))
+        try:
+            vis = _icon_vis(st, geo.screen_heading(heading))
+            sprite, ix, iy = _place_sprite(vis, fx, fy)
+        except Exception:
+            continue
+        out.append(_clip_to_display(sprite, ix, iy))
+    # Halo, then icon. Trail tips are lines (see live_trail_connectors), and
+    # the sweep is stamped above both.
+    out[0:0] = glows
+    _label_hits.clear()
+    for lb in _live_labels:
+        base = live_pos.get(lb["id"])
+        vis = lb.get("vis")
+        if base is None or vis is None:
+            continue
+        try:
+            sprite, ix, iy = _place_sprite(vis, base[0] + lb["off"][0], base[1] + lb["off"][1])
+        except Exception:
+            continue
+        out.append((sprite, ix, iy))
+        _label_hits.append((
+            lb["id"],
+            pygame.Rect(ix - sprite.get_width() // 2, iy - sprite.get_height() // 2,
+                        sprite.get_width(), sprite.get_height()),
+        ))
+    return out
+
+
+def draw_live_icons(surface) -> None:
+    """Direct-to-surface variant for paths that blit the layer themselves."""
+    from display.round_touch import rotation
+
+    frame = live_icon_frame()
+    # Logical surface — present() rotates the whole frame afterwards.
+    rotation._blit_live_connectors(surface, (0, 0), 0, _live_connectors)
+    for sprite, x, y in frame:
+        surface.blit(sprite, (int(x) - sprite.get_width() // 2, int(y) - sprite.get_height() // 2))
+
+
+# Identity of the flight last tapped on the radar (set by the app) — its trail
+# stays visible while the "selected" trail mode is on.
+_trail_selected_id: str | None = None
+
+
+def set_trail_selection(flight) -> None:
+    """Remember the tapped flight so its trail is drawn on the radar."""
+    global _trail_selected_id
+    try:
+        from display.round_touch import position_smooth
+
+        _trail_selected_id = position_smooth.identity_of(flight) if flight else None
+    except Exception:
+        _trail_selected_id = None
+    invalidate_frame_layer()
+
+
+_trail_overlay: pygame.Surface | None = None
+
+
+def _trail_overlay_surface(size) -> pygame.Surface:
+    """Reuse one full-screen trail buffer so a bake doesn't allocate every time."""
+    global _trail_overlay
+    if _trail_overlay is None or _trail_overlay.get_size() != size:
+        _trail_overlay = pygame.Surface(size, pygame.SRCALPHA)
+    else:
+        _trail_overlay.fill((0, 0, 0, 0))
+    return _trail_overlay
+
+
+def _draw_trails(surface, items) -> None:
+    """Subtle, translucent speed-coloured paths under the icons (FR24 style)."""
+    global _trail_heads_building
+    mode = settings.flight_trails_mode()
+    if mode == "off":
+        _trail_heads_building = {}
+        return
+    from display.round_touch import flight_trails, position_smooth
+
+    import time as _time
+
+    now = _time.time()
+    overlay = None
+    width = max(3, theme.s(2.4))
+    dot_r = max(2, theme.s(1.5))
+    project = lambda lat, lon: geo.lat_lon_to_screen(lat, lon)
+    drawn = set()
+    _trail_heads_building = {}
+    for _, flight, (x, y) in items:
+        if flight.get("kind") == "vessel":
+            continue
+        ident = position_smooth.identity_of(flight)
+        if not ident:
+            continue
+        if mode != "all" and not (ident == _trail_selected_id or _is_tracked(flight)):
+            continue
+        drawn.add(ident)
+        if overlay is None:
+            overlay = _trail_overlay_surface(surface.get_size())
+        flight_trails.draw_trail(
+            overlay, ident, project, width=width, now=now,
+            base_alpha=_TRAIL_ALPHA, head_xy=(x, y), dot_radius=dot_r,
+        )
+        pts = flight_trails.points(ident)
+        if pts:
+            _trail_heads_building[ident] = (
+                (x, y), flight_trails.speed_color(pts[-1][2]), width,
+            )
+    # Aircraft that already left the display: the path keeps fading out.
+    for ident in flight_trails.identities():
+        if ident in drawn:
+            continue
+        if mode != "all" and ident != _trail_selected_id:
+            continue
+        if overlay is None:
+            overlay = _trail_overlay_surface(surface.get_size())
+        flight_trails.draw_trail(
+            overlay, ident, project, width=width, now=now,
+            base_alpha=_TRAIL_ALPHA, head_xy=None, dot_radius=dot_r,
+        )
+    if overlay is not None:
+        surface.blit(overlay, (0, 0))
+
+
+_TRAIL_ALPHA = int(os.environ.get("FLIGHTSCNR_TRAIL_ALPHA", "125"))
 
 
 def _is_tracked(flight) -> bool:
@@ -1450,7 +1947,7 @@ def _flight_icon_color(flight, *, compact: bool):
     return _overlay_color_for_basemap(custom or theme.AIRCRAFT)
 
 
-def _draw_flights(surface, flights):
+def _draw_flights(surface, flights, live=None, live_labels=None):
     from display.round_touch import alert_prefs, frame_debug, map_bg
 
     global _alert_glow_in_layer, _layer_pulse_phase
@@ -1483,7 +1980,7 @@ def _draw_flights(surface, flights):
             _, _, dist_km = geo.local_offset_km(lat, lon)
             if dist_km > max_km:
                 continue
-            if dist_km <= inner_max:
+            if dist_km <= inner_max or scale.overscan_enabled():
                 x, y = geo.lat_lon_to_screen(lat, lon)
                 inner_items.append((dist_km, flight, (x, y)))
             else:
@@ -1552,15 +2049,36 @@ def _draw_flights(surface, flights):
                 flight=flight,
             )
 
+        _draw_trails(surface, inner_items)
+        from display.round_touch import position_smooth
+
         for _, flight, (x, y) in inner_items:
             heading = geo.screen_heading(flight.get("heading") or 0)
             color = _flight_icon_color(flight, compact=False)
-            if _paint_blip_glow(
+            is_heli = heli_icon_form and aircraft.target_category(flight) == "heli"
+            # Parked vessels are a dot on this layer. A live sprite per hull
+            # redrew a harbour full of anchored boats on every sweep frame.
+            if live is not None and not vessel_declutter.is_parked(flight):
+                ident = position_smooth.identity_of(flight)
+                if ident:
+                    # Drawn every frame. The halo is a live sprite too, so it
+                    # stays under the icon instead of baking into this layer.
+                    st = _icon_state.get(ident)
+                    if st is None:
+                        st = _icon_state[ident] = {"id": ident, "vis": None}
+                    st["flight"] = flight
+                    st["color"] = color
+                    st["xy"] = (x, y)
+                    st["heli"] = bool(is_heli)
+                    live.append(st)
+                    continue
+            glow = _paint_blip_glow(
                 surface, x, y, flight, color,
                 compact=False, pulse_on=blinking,
-            ):
+            )
+            if glow:
                 highlighted_any = True
-            if heli_icon_form and aircraft.target_category(flight) == "heli":
+            if is_heli:
                 heli_any = True
             aircraft.draw_plane_icon(surface, x, y, heading, color, flight=flight)
         from display.round_touch.screens import iss as iss_screen
@@ -1569,7 +2087,14 @@ def _draw_flights(surface, flights):
         _t = frame_debug.end("2r_f_icons", _t)
 
         blips = [(x, y) for _, _, (x, y) in inner_items]
-        _draw_labels(surface, inner_items, blips)
+        live_ids = {st["id"] for st in live} if live is not None else None
+        label_items = (
+            [it for it in inner_items if it[0] <= inner_max]
+            if scale.overscan_enabled() else inner_items
+        )
+        _draw_labels(surface, label_items, blips, live_ids, live_labels)
+        if live is not None:
+            _prune_live_state(live)
         frame_debug.end("2r_f_tags", _t)
         frame_debug.count("targets_drawn", len(rim_items) + len(inner_items))
         frame_debug.count("targets_inner", len(inner_items))
@@ -1898,7 +2423,9 @@ def _flight_screen_xy(flight) -> tuple[int, int] | None:
     if lat is None or lon is None:
         return None
     _, _, dist_km = geo.local_offset_km(lat, lon)
-    if dist_km <= geo.inner_ring_max_km():
+    if dist_km <= geo.inner_ring_max_km() or (
+        scale.overscan_enabled() and dist_km <= geo.fetch_max_km()
+    ):
         return geo.lat_lon_to_screen(lat, lon)
     return geo.beyond_ring_position(lat, lon)
 

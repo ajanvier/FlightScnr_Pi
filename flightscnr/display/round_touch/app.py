@@ -60,6 +60,7 @@ from display.round_touch import (
     wildfire_overlay,
     earthquake_overlay,
     update_bubble,
+    tag_button,
     zoom_buttons,
 )
 from utilities import aircraft_alert
@@ -946,15 +947,22 @@ class RoundTouchDisplay:
             layer, layer_gen = radar.frame_layer_snapshot()
             if layer is not None:
                 show_sweep = settings.show_sweep_line()
+                # Build icons first, then sample the beam, so a slow icon
+                # frame cannot freeze the angle the wedge is drawn at.
+                live_icons = radar.live_icon_frame()
+                live_connectors = radar.live_trail_connectors()
+                sweep_angle = radar.current_sweep_angle()
                 if FRAME_DEBUG:
                     _t = time.perf_counter()
                     rotation.present_radar_sweep(
                         self._display,
                         layer,
                         layer_gen,
-                        radar.current_sweep_angle(),
+                        sweep_angle,
                         theme.SWEEP,
                         draw_sweep=show_sweep,
+                        live_icons=live_icons,
+                        live_connectors=live_connectors,
                     )
                     self._stage("4_present", time.perf_counter() - _t)
                 else:
@@ -962,9 +970,11 @@ class RoundTouchDisplay:
                         self._display,
                         layer,
                         layer_gen,
-                        radar.current_sweep_angle(),
+                        sweep_angle,
                         theme.SWEEP,
                         draw_sweep=show_sweep,
+                        live_icons=live_icons,
+                        live_connectors=live_connectors,
                     )
                 return
 
@@ -1929,6 +1939,9 @@ class RoundTouchDisplay:
             radar.invalidate_frame_layer()
         elif action == "color_by_altitude":
             settings.toggle_color_by_altitude()
+            radar.invalidate_frame_layer()
+        elif action == "smooth_motion":
+            settings.toggle_smooth_motion()
             radar.invalidate_frame_layer()
         elif action == "rim_style":
             self._open_atc_picker("rim_style")
@@ -3227,6 +3240,18 @@ class RoundTouchDisplay:
                 radar.invalidate_frame_layer()
                 self._safe_draw()
                 return True
+            if settings.tap_labels_mode():
+                # Tap mode: holding a target opens its menu instead of panning.
+                start = getattr(self.input, "_start", None)
+                if start:
+                    held, _d2 = radar.pick_flight_at(
+                        self._radar_flights(), start[0], start[1]
+                    )
+                    if held is not None:
+                        self.input.suppress_finish_result()
+                        self._long_press_pan.clear_candidate()
+                        self._open_picked_flight(held)
+                        return True
             self._begin_map_pan(from_long_press=True)
             return True
         return False
@@ -3714,11 +3739,18 @@ class RoundTouchDisplay:
         picked, _ = radar.pick_flight_at(self._radar_flights(), x, y, alt_x, alt_y)
         return self._open_picked_flight(picked)
 
+    def _remember_trail_selection(self, flight: dict | None) -> None:
+        """Keep the tapped aircraft as the selected-trail target."""
+        if not flight:
+            return
+        radar.set_trail_selection(None if flight.get("kind") == "vessel" else flight)
+
     def _open_picked_flight(self, picked: dict | None) -> bool:
         ordered = self._ordered_flights()
         if not picked or not ordered:
             return False
         self._select_flight(picked, ordered)
+        self._remember_trail_selection(picked)
         if picked.get("kind") == "vessel":
             logger.info(
                 "[ais] selected vessel MMSI=%s name=%r",
@@ -4846,6 +4878,23 @@ class RoundTouchDisplay:
                             zoom_action := zoom_buttons.hit_button(tap[0], tap[1])
                         ) is not None:
                             self._apply_zoom_button(zoom_action)
+                        elif (
+                            settings.hud_tap_labels()
+                            and settings.radar_hud_enabled()
+                            and not settings.radar_hud_arrange()
+                            and radar_hud.hit_hud(tap[0], tap[1])
+                        ):
+                            # Tap on the HUD pill itself: tags always on <-> tap mode.
+                            tag_button.toggle()
+                            try:
+                                radar.show_location_toast(
+                                    tr("settings.row.traffic_labels", value=settings.traffic_labels_label())
+                                )
+                            except Exception:
+                                pass
+                            self._note_activity()
+                            radar.invalidate_frame_layer()
+                            self._safe_draw()
                         elif favourite_tile.is_open() and (
                             (
                                 fav_id := favourite_tile.hit_item(tap[0], tap[1])
@@ -5929,6 +5978,16 @@ class RoundTouchDisplay:
             radar.invalidate_frame_layer()
             self._note_activity()
             return True
+        if settings.tap_labels_mode():
+            hit_id = radar.label_hit_id(x, y)
+            if hit_id:
+                for f in self._radar_flights():
+                    if radar._pin_id(f) == hit_id:
+                        airport_overlay.clear_callout()
+                        radar.toggle_label_pin(f)
+                        self._remember_trail_selection(f)
+                        self._note_activity()
+                        return True
         flight, flight_d2 = radar.pick_flight_at(self._radar_flights(), x, y, alt_x, alt_y)
         fire, fire_d2 = wildfire_overlay.pick_fire_at(x, y, alt_x, alt_y)
         quake, quake_d2 = earthquake_overlay.pick_quake_at(x, y, alt_x, alt_y)
@@ -5988,6 +6047,12 @@ class RoundTouchDisplay:
             or flight_d2 <= airport_d2 + flight_bias
         ):
             airport_overlay.clear_callout()
+            if settings.tap_labels_mode():
+                # Tap shows / hides the tag; a long press opens the menu.
+                radar.toggle_label_pin(flight)
+                self._remember_trail_selection(flight)
+                self._note_activity()
+                return True
             return self._open_picked_flight(flight)
         if airport is not None:
             from display.round_touch import airport_tile

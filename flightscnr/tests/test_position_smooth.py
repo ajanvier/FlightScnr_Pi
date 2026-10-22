@@ -19,6 +19,33 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class TestParkedVesselsStayUntracked(unittest.TestCase):
+    def test_parked_vessel_does_not_get_a_smoother_track(self):
+        from display.round_touch.position_smooth import PositionSmoother
+
+        sm = PositionSmoother()
+        parked = {
+            "kind": "vessel",
+            "mmsi": "123456789",
+            "stationary": True,
+            "sog_kt": 0.0,
+            "plane_latitude": 37.8,
+            "plane_longitude": -122.4,
+        }
+        moving = {
+            "kind": "vessel",
+            "mmsi": "987654321",
+            "sog_kt": 8.0,
+            "heading": 90,
+            "ground_speed": 8.0,
+            "plane_latitude": 37.81,
+            "plane_longitude": -122.41,
+        }
+        out = sm.apply([parked, moving], now=1_000.0)
+        self.assertIs(out[0], parked)
+        self.assertEqual(set(sm._tracks), {"mmsi:987654321"})
+
+
 class TestOffsetLatLon(unittest.TestCase):
     def test_moves_east_at_heading_90(self):
         from display.round_touch.position_smooth import offset_lat_lon
@@ -165,6 +192,59 @@ class TestPositionSmoother(unittest.TestCase):
         sm.apply([flight], now=t0)
         later = sm.apply([flight], now=t0 + 10.0)[0]
         self.assertGreater(later["plane_latitude"], 54.3)
+
+    def test_resume_gap_keeps_coasting_ahead_of_a_lagged_fix(self):
+        """A pause must not snap a marker back onto a slower stale report."""
+        from display.round_touch.position_smooth import PositionSmoother, _distance_km
+
+        sm = PositionSmoother()
+        fast = {
+            "icao_hex": "ABC123",
+            "plane_latitude": 40.0,
+            "plane_longitude": -74.0,
+            "heading": 90.0,
+            "ground_speed": 400.0,
+        }
+        t0 = 50_000.0
+        sm.apply([fast], now=t0)
+        ahead = sm.apply([fast], now=t0 + 10.0)[0]
+        lagged = dict(fast)
+        lagged["ground_speed"] = 200.0
+        lagged["plane_longitude"] = -74.0 + (ahead["plane_longitude"] + 74.0) * 0.5
+        sm.apply([lagged], now=t0 + 10.0)
+        later = sm.apply([lagged], now=t0 + 16.0)[0]
+        self.assertGreater(later["plane_longitude"], ahead["plane_longitude"])
+        jump_km = _distance_km(
+            ahead["plane_latitude"],
+            ahead["plane_longitude"],
+            later["plane_latitude"],
+            later["plane_longitude"],
+        )
+        # Six seconds at 400 kt is about 1.2 km. A snap onto the lagged fix
+        # would be several kilometres the other way.
+        self.assertLess(jump_km, 2.0)
+
+    def test_trails_are_not_recorded_while_off(self):
+        from unittest import mock
+
+        from display.round_touch import flight_trails
+        from display.round_touch.position_smooth import PositionSmoother
+
+        flight_trails.clear()
+        sm = PositionSmoother()
+        flight = {
+            "icao_hex": "ABC123",
+            "plane_latitude": 40.0,
+            "plane_longitude": -74.0,
+            "heading": 90.0,
+            "ground_speed": 360.0,
+        }
+        with mock.patch(
+            "display.round_touch.settings.flight_trails_mode", return_value="off"
+        ):
+            sm.apply([flight], now=60_000.0)
+            sm.apply([flight], now=60_002.0)
+        self.assertEqual(flight_trails.points("hex:ABC123"), [])
 
 
 if __name__ == "__main__":

@@ -84,6 +84,7 @@ DISPLAY_ACTIONS = (
     "sweep",
     "tag_leaders",
     "color_by_altitude",
+    "smooth_motion",
     "rim_style",
     "units",
     "range",
@@ -3043,6 +3044,7 @@ def _display_row_labels() -> list[str]:
             else tr("settings.row.tag_leaders_off")
         ),
         tr("settings.row.color_altitude"),
+        tr("settings.row.smooth_motion"),
         tr("settings.row.rim_targets", value=settings.rim_target_style_label()),
         tr("settings.row.units", value=settings.unit_preset_label()),
         tr("settings.row.radar_range", value=settings.scale_label()),
@@ -3124,6 +3126,7 @@ _TOGGLE_ROW_STATE = {
     "sweep": settings.show_sweep_line,
     "tag_leaders": settings.show_tag_leaders,
     "color_by_altitude": settings.color_by_altitude,
+    "smooth_motion": settings.smooth_motion_setting,
     "radar_hud": settings.radar_hud_enabled,
     "background_texture": settings.background_texture,
     "zoom_buttons": settings.radar_zoom_buttons,

@@ -948,6 +948,8 @@ def display_json():
             "auto_idle_clock": settings.auto_idle_clock_enabled(),
             "display_rotation": settings.display_rotation(),
             "clock_12hr": settings.use_12hr_clock(),
+            "flight_trails": settings.flight_trails_mode(),
+            "flight_trail_seconds": settings.flight_trail_seconds(),
             "display_language": settings.display_language(),
             "date_format": settings.date_format(),
             "default_clock": settings.default_clock(),
@@ -1005,6 +1007,10 @@ def display_save():
         settings.set_display_rotation(data.get("display_rotation"))
     if "clock_12hr" in data:
         settings.set_use_12hr_clock(bool(data.get("clock_12hr")))
+    if "flight_trails" in data:
+        settings.set_flight_trails_mode(str(data.get("flight_trails") or ""))
+    if "flight_trail_seconds" in data:
+        settings.set_flight_trail_seconds(data.get("flight_trail_seconds"))
     if "display_language" in data or "date_format" in data:
         settings.set_language_region(
             str(data.get("display_language", settings.display_language())),
@@ -1101,6 +1107,8 @@ def display_save():
             "auto_idle_clock": settings.auto_idle_clock_enabled(),
             "display_rotation": settings.display_rotation(),
             "clock_12hr": settings.use_12hr_clock(),
+            "flight_trails": settings.flight_trails_mode(),
+            "flight_trail_seconds": settings.flight_trail_seconds(),
             "display_language": settings.display_language(),
             "date_format": settings.date_format(),
             "default_clock": settings.default_clock(),
@@ -1595,6 +1603,8 @@ def radar_json():
             "facing_deg": settings.facing_deg(),
             "show_sweep_line": settings.show_sweep_line(),
             "show_tag_leaders": settings.tag_leaders_preferred(),
+            "hud_tap_labels": settings.hud_tap_labels(),
+            "smooth_motion": settings.smooth_motion_setting(),
             "rim_target_style": settings.rim_target_style(),
             "show_precipitation": settings.show_precipitation(),
             "show_wildfires": settings.show_wildfires(),
@@ -1788,6 +1798,10 @@ def radar_save():
         settings.set_facing_deg(data.get("facing_deg"))
     if "show_sweep_line" in data:
         settings.set_show_sweep_line(bool(data.get("show_sweep_line")))
+    if "hud_tap_labels" in data:
+        settings.set_hud_tap_labels(bool(data.get("hud_tap_labels")))
+    if "smooth_motion" in data:
+        settings.set_smooth_motion(bool(data.get("smooth_motion")))
     if "show_tag_leaders" in data:
         settings.set_show_tag_leaders(bool(data.get("show_tag_leaders")))
     if "rim_target_style" in data:

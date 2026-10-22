@@ -81,6 +81,33 @@ def select(index: int):
     _active_index = max(0, min(index, len(SCALE_BANDS) - 1))
 
 
+def fetch_screen_radius() -> float:
+    """Screen radius (px) out to which aircraft are fetched and drawn.
+
+    With live icons the fetch area reaches past the visible edge by one icon
+    radius, so aircraft glide in and out with their real symbol instead of
+    switching to a rim dot.
+    """
+    from display.round_touch import theme
+
+    if overscan_enabled():
+        return theme.VISIBLE_RADIUS + theme.AIRCRAFT_ICON_RADIUS + theme.s(2)
+    return theme.VISIBLE_RADIUS - theme.BEYOND_RING_MARGIN
+
+
+def overscan_enabled() -> bool:
+    """True when aircraft glide in/out past the edge (rim style "glide").
+
+    Glide needs per-frame icons. With smooth motion off, out-of-range targets
+    stay on the rim in the plane style.
+    """
+    try:
+        from display.round_touch import settings
+    except ImportError:
+        return False
+    return settings.smooth_motion_enabled() and settings.rim_target_style() == "glide"
+
+
 def search_radius_nm(index: int | None = None) -> float:
     """Nautical-mile fetch radius for rim targets (coverage scaled to visible edge)."""
     if index is None:
@@ -91,8 +118,7 @@ def search_radius_nm(index: int | None = None) -> float:
     try:
         from display.round_touch import theme
 
-        screen_r = theme.VISIBLE_RADIUS - theme.BEYOND_RING_MARGIN
-        fetch_km = band["coverage_km"] * (screen_r / theme.GRID_OUTER_RADIUS)
+        fetch_km = band["coverage_km"] * (fetch_screen_radius() / theme.GRID_OUTER_RADIUS)
     except ImportError:
         fetch_km = band["coverage_km"]
     return fetch_km / 1.852

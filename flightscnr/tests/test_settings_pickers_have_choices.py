@@ -101,5 +101,5 @@ def test_rim_style_specifically():
     """The reported row: Display > Rim targets."""
     assert "rim_style" in info.LIST_PICKER_KINDS
     items = info.atc_picker_items("rim_style")
-    assert [i["id"] for i in items] == ["plane", "dot"]
+    assert [i["id"] for i in items] == ["glide", "plane", "dot"]
     assert sum(1 for i in items if i["selected"]) == 1

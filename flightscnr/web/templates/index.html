@@ -344,6 +344,7 @@
                 <option value="marine">Marine Only</option>
                 <option value="both">Aircraft and Marine</option>
                 <option value="off">OFF</option>
+                <option value="tap" data-i18n="portal.radar.traffic_labels.tap">Only when tapped</option>
             </select>
             <p class="hint">Callsign/type/altitude on aircraft, and vessel name tags. Turn off to declutter a busy radar; tap a symbol for details.</p>
             <label for="aircraft_tag_id">Aircraft ID on tags</label>
@@ -354,13 +355,24 @@
                 <option value="alternate">Alternate</option>
             </select>
             <p class="hint">Top line of each aircraft tag: marketing flight number (e.g. UA5796), ATC callsign (e.g. SKW5796), tail / registration (e.g. N12345), or alternate through whichever of those differ.</p>
+            <div class="chk">
+                <label for="hud_tap_labels" data-i18n="portal.radar.hud_tap_labels.label">Tap the HUD to switch tags (always on / only when tapped)</label>
+                <span class="switch"><input id="hud_tap_labels" type="checkbox"><span class="track"></span></span>
+            </div>
+            <p class="hint" data-i18n="portal.radar.hud_tap_labels.hint">A tap on the free area of the radar HUD pill flips the traffic labels between your normal mode and "Only when tapped". Off keeps the HUD taps as before.</p>
             <div class="chk" id="show_tag_leaders_row">
                 <label for="show_tag_leaders">Show tag leaders</label>
                 <span class="switch"><input id="show_tag_leaders" type="checkbox"><span class="track"></span></span>
             </div>
             <p class="hint">Hockey-stick underline and diagonal from each callsign tag to its aircraft or vessel. Same color as the blip. Only drawn when traffic labels are on.</p>
+            <div class="chk">
+                <label for="smooth_motion" data-i18n="portal.radar.smooth_motion.label">Smooth aircraft motion</label>
+                <span class="switch"><input id="smooth_motion" type="checkbox"><span class="track"></span></span>
+            </div>
+            <p class="hint" data-i18n="portal.radar.smooth_motion.hint">Glide icons between radar updates instead of stepping them. Off keeps the usual baked icons. Fly smoothly in/out needs this on.</p>
             <label for="rim_target_style">Out-of-range rim targets</label>
             <select id="rim_target_style">
+                <option value="glide" data-i18n="portal.radar.rim_targets.glide">Fly smoothly in/out (full symbol)</option>
                 <option value="plane">Aircraft icon</option>
                 <option value="dot">Dot blip</option>
             </select>
@@ -636,6 +648,22 @@
                 <span class="switch"><input id="clock_12hr" type="checkbox" checked><span class="track"></span></span>
             </div>
             <p class="hint">Applies everywhere: radar HUD, clock screen, and settings. Off = 24-hour.</p>
+            <label for="flight_trails" data-i18n="portal.display.flight_trails.label">Flight trails on radar</label>
+            <select id="flight_trails">
+                <option value="off" data-i18n="portal.display.flight_trails.off">Trails off</option>
+                <option value="selected" data-i18n="portal.display.flight_trails.selected">Selected flight (tracked / last tapped)</option>
+                <option value="all" data-i18n="portal.display.flight_trails.all">All aircraft</option>
+            </select>
+            <label for="flight_trail_seconds" data-i18n="portal.display.flight_trail_seconds.label">Trail length</label>
+            <select id="flight_trail_seconds">
+                <option value="30" data-i18n="portal.display.flight_trail_seconds.s30">30 s</option>
+                <option value="60" data-i18n="portal.display.flight_trail_seconds.m1">1 min</option>
+                <option value="120" data-i18n="portal.display.flight_trail_seconds.m2">2 min</option>
+                <option value="300" data-i18n="portal.display.flight_trail_seconds.m5">5 min</option>
+                <option value="600" data-i18n="portal.display.flight_trail_seconds.m10">10 min</option>
+            </select>
+            <p class="hint" data-i18n="portal.display.flight_trail_seconds.hint">How long a trail stays visible; it fades out from the back and keeps fading after the aircraft has left the display.</p>
+            <p class="hint" data-i18n="portal.display.flight_trails.hint">Path flown so far, coloured by ground speed (blue = slow, red = fast). Only the path seen since the aircraft entered range is shown.</p>
             <label for="default_clock">Daytime clock face</label>
             <select id="default_clock">
                 <option value="digital">Digital</option>
@@ -1772,6 +1800,8 @@ async function loadAll() {
         $("facing_deg").value = String(Math.round(Number(r.facing_deg) || 0) % 360);
         $("show_sweep").checked = !!r.show_sweep_line;
         if ($("show_tag_leaders")) $("show_tag_leaders").checked = r.show_tag_leaders !== false;
+        if ($("hud_tap_labels")) $("hud_tap_labels").checked = !!r.hud_tap_labels;
+        if ($("smooth_motion")) $("smooth_motion").checked = !!r.smooth_motion;
         if ($("rim_target_style")) $("rim_target_style").value = r.rim_target_style || "plane";
         syncTagLeadersControl();
         $("show_precip").checked = r.show_precipitation !== false;
@@ -1808,6 +1838,8 @@ async function loadAll() {
         $("clock_timeout").value = String(d.clock_timeout_s ?? 10);
         $("idle_clock").checked = !!d.auto_idle_clock;
         if ($("clock_12hr")) $("clock_12hr").checked = d.clock_12hr !== false;
+        if ($("flight_trails")) $("flight_trails").value = d.flight_trails || "off";
+        if ($("flight_trail_seconds")) $("flight_trail_seconds").value = String(d.flight_trail_seconds || 120);
         if ($("default_clock")) {
             const face = d.default_clock;
             $("default_clock").value = (face === "analog" || face === "night" || face === "flieger") ? face : "digital";
@@ -2245,6 +2277,8 @@ async function saveRadar() {
                 facing_deg: Number($("facing_deg").value),
                 show_sweep_line: $("show_sweep").checked,
                 show_tag_leaders: $("show_tag_leaders") ? $("show_tag_leaders").checked : true,
+                hud_tap_labels: $("hud_tap_labels") ? $("hud_tap_labels").checked : false,
+                smooth_motion: $("smooth_motion") ? $("smooth_motion").checked : false,
                 rim_target_style: $("rim_target_style") ? $("rim_target_style").value : "plane",
                 show_precipitation: $("show_precip").checked,
                 show_wildfires: $("show_wildfires") ? $("show_wildfires").checked : false,
@@ -2548,6 +2582,8 @@ async function saveAndReloadSettings(statusId) {
                 facing_deg: Number($("facing_deg").value),
                 show_sweep_line: $("show_sweep").checked,
                 show_tag_leaders: $("show_tag_leaders") ? $("show_tag_leaders").checked : true,
+                hud_tap_labels: $("hud_tap_labels") ? $("hud_tap_labels").checked : false,
+                smooth_motion: $("smooth_motion") ? $("smooth_motion").checked : false,
                 rim_target_style: $("rim_target_style") ? $("rim_target_style").value : "plane",
                 show_precipitation: $("show_precip").checked,
                 show_wildfires: $("show_wildfires") ? $("show_wildfires").checked : false,
@@ -2579,6 +2615,8 @@ async function saveAndReloadSettings(statusId) {
                 clock_timeout_s: Number($("clock_timeout").value),
                 auto_idle_clock: $("idle_clock").checked,
                 clock_12hr: $("clock_12hr") ? $("clock_12hr").checked : true,
+                flight_trails: $("flight_trails") ? $("flight_trails").value : "off",
+                flight_trail_seconds: $("flight_trail_seconds") ? parseInt($("flight_trail_seconds").value, 10) : 120,
                 date_format: $("date_order") ? $("date_order").value : "us",
                 default_clock: $("default_clock") ? $("default_clock").value : "digital",
                 default_clock_off_hours: $("default_clock_off_hours")

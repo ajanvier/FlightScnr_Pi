@@ -412,9 +412,10 @@ def _parse_tag_font_scale(raw: str) -> float:
 
 RADAR_TAG_FONT_SCALE = _parse_tag_font_scale(os.environ.get("RADAR_TAG_FONT_SCALE", ""))
 
-# Out-of-range targets on the radar rim: dot | plane. Normalized here only —
-# display.round_touch.settings.rim_target_style() reads this value as-is.
-RIM_STYLES = ("plane", "dot")
+# Out-of-range targets on the radar rim: dot | plane | glide. Normalized here
+# only — display.round_touch.settings.rim_target_style() reads this value as-is.
+# glide draws the full symbol past the edge, and only while smooth motion is on.
+RIM_STYLES = ("plane", "dot", "glide")
 
 
 def _parse_rim_style(raw: str) -> str:

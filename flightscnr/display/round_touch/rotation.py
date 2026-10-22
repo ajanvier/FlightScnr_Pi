@@ -9,8 +9,11 @@
 
 """Display rotation — logical draw buffer vs physical screen and touch."""
 
+import logging
 import math
+import os
 import time
+import weakref
 
 import pygame
 
@@ -35,6 +38,14 @@ _lofi_tile_stamp = None
 _lofi_tile_stamp_key = None
 _prev_radial_rect: pygame.Rect | None = None
 _prev_location_toast_rect: pygame.Rect | None = None
+# Rects of the live aircraft icons drawn last frame (erased from the base).
+_prev_icon_rects: list = []
+# Rotated copies of live sprites, keyed by the sprite object. A bare id()
+# collides when pygame reuses a freed Surface address, which painted one
+# aircraft type with another's silhouette.
+_rot_sprite_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# Scratch for translucent trail tips. Grown to the largest tip and reused.
+_line_scratch: pygame.Surface | None = None
 # Radar layer generation seen but not yet rotated/swapped (one-frame pipeline).
 _pending_key = None
 # Pre-rotated next base prepared between frames (see prewarm_base).
@@ -43,6 +54,11 @@ _next_base_key = None
 # A full-frame present() ran (modal, other screen); the next fast radar frame
 # must repaint the whole display rather than trust dirty-rect state.
 _needs_full = False
+# Trial: after a radar-layer swap, push the new map in horizontal bands while
+# the beam stays on its dirty rectangle. FLIGHTSCNR_DECOUPLE_SWEEP=0 restores
+# the full-screen flip. Another screen still flips.
+_upload_y: int | None = None
+_decouple_logged = False
 
 
 def prewarm_base(base_layer: pygame.Surface, layer_gen: int) -> None:
@@ -142,22 +158,26 @@ def present_radar_sweep(
     sweep_color,
     *,
     draw_sweep: bool = True,
+    live_icons: list | None = None,
+    live_connectors: list | None = None,
 ) -> None:
     """Blit a cached rotated radar base, then optionally draw the sweep.
 
-    Avoids re-rotating the full 720×720 frame every sweep tick (was ~4.5ms on
-    Pi with DISPLAY_ROTATION=90). The static layer is rotated only when it
-    rebuilds (~10Hz); each frame restores the previous sweep AABB from the
-    cached base and paints a new wedge. Uses display.update(dirty) so X11
-    doesn't re-push the whole framebuffer.
+    Avoids re-rotating the full frame every sweep tick (was ~4.5ms on Pi
+    with DISPLAY_ROTATION=90). The static layer is rotated only when it
+    rebuilds; each frame restores the previous sweep AABB from the cached
+    base and paints a new wedge. Uses display.update(dirty) so X11 doesn't
+    re-push the whole framebuffer.
     """
     global _rot_base, _rot_base_key, _prev_sweep_rect, _pending_key, _needs_full
     global _next_base, _next_base_key, _prev_hud_rect, _prev_bubble_rect
     global _prev_airport_callout_rect, _prev_location_toast_rect
     global _prev_airport_tile_rect, _prev_lofi_rect, _prev_radial_rect
-    global _prev_lofi_tile_rect, _prev_favourite_tile_rect
+    global _prev_lofi_tile_rect, _prev_favourite_tile_rect, _prev_icon_rects
+    global _upload_y
     from display.round_touch import draw
 
+    had_layer = _rot_base is not None
     rotation = rotation_degrees()
     # Match prewarm_base — generation identifies the layer contents.
     key = (layer_gen, rotation, theme.SIZE)
@@ -217,18 +237,29 @@ def present_radar_sweep(
             display.blit(_rot_base, origin_off)
         else:
             display.blit(_rot_base, (0, 0))
-        _prev_sweep_rect = None
-        _prev_hud_rect = None
-        _prev_bubble_rect = None
-        _prev_airport_callout_rect = None
-        _prev_airport_tile_rect = None
-        _prev_lofi_rect = None
-        _prev_lofi_tile_rect = None
-        _prev_favourite_tile_rect = None
-        _prev_radial_rect = None
-        _prev_location_toast_rect = None
-        full_refresh = True
+        # Keep the beam on dirty rects. The new map is already in the pygame
+        # surface; bands below upload it without a full-screen flip. Previous
+        # wedge/icon rects stay set so this frame still pushes those spots
+        # (the blit replaced them with the new map).
+        decouple = swap_in and not _needs_full and had_layer and _decouple_layer_flip()
         _needs_full = False
+        if decouple:
+            _queue_layer_upload()
+            _log_decouple_once()
+        else:
+            _prev_sweep_rect = None
+            _prev_hud_rect = None
+            _prev_bubble_rect = None
+            _prev_airport_callout_rect = None
+            _prev_airport_tile_rect = None
+            _prev_lofi_rect = None
+            _prev_lofi_tile_rect = None
+            _prev_favourite_tile_rect = None
+            _prev_radial_rect = None
+            _prev_location_toast_rect = None
+            _prev_icon_rects = []
+            _upload_y = None
+            full_refresh = True
     else:
         if display.get_size() != _rot_base.get_size():
             origin_off = _center_offset(display, _rot_base)
@@ -241,6 +272,10 @@ def present_radar_sweep(
                 r.w,
                 r.h,
             )
+            display.blit(_rot_base, r.topleft, src)
+        # Erase last frame's live aircraft icons (the base has none baked in).
+        for r in _prev_icon_rects:
+            src = pygame.Rect(r.x - origin_off[0], r.y - origin_off[1], r.w, r.h)
             display.blit(_rot_base, r.topleft, src)
         # Erase previous HUD stamp the same way (base has no HUD baked in).
         if _prev_hud_rect is not None:
@@ -333,6 +368,14 @@ def present_radar_sweep(
     old_lofi = _prev_lofi_rect
     old_radial = _prev_radial_rect
     old_location = _prev_location_toast_rect
+    # Trail tips, then icons, then the sweep, so the beam still passes over
+    # the targets. Tips are short lines — a per-frame sprite here was a
+    # dirty rectangle big enough to chop the wedge on X11.
+    old_icons = _prev_icon_rects
+    conn_rects = _blit_live_connectors(display, origin_off, rotation, live_connectors)
+    icon_rects = _blit_live_icons(display, origin_off, rotation, live_icons)
+    new_icons = conn_rects + icon_rects
+    _prev_icon_rects = new_icons
     new_rect = None
     if draw_sweep:
         # present() rotates the frame by -rotation; a logical tip at angle θ lands
@@ -404,6 +447,9 @@ def present_radar_sweep(
                 fav_tile_dirty,
                 old_radial,
                 radial_dirty,
+                *old_icons,
+                *new_icons,
+                *_take_upload_bands(display.get_width(), display.get_height()),
             )
             if r is not None
         ]
@@ -413,6 +459,135 @@ def present_radar_sweep(
             pygame.display.flip()
     if frame_debug.ENABLED:
         frame_debug.stage("4r_flip" if full_refresh else "4s_update", time.perf_counter() - _t)
+
+
+def _decouple_layer_flip() -> bool:
+    """True while the layer-swap trial is on (default)."""
+    raw = os.environ.get("FLIGHTSCNR_DECOUPLE_SWEEP", "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _log_decouple_once() -> None:
+    global _decouple_logged
+    if _decouple_logged:
+        return
+    _decouple_logged = True
+    logging.getLogger("flightscnr.display").info(
+        "Sweep trial: map updates upload in bands; the beam stays on dirty rects "
+        "(FLIGHTSCNR_DECOUPLE_SWEEP=0 restores the full-screen flip)"
+    )
+
+
+def _queue_layer_upload() -> None:
+    global _upload_y
+    _upload_y = 0
+
+
+def _take_upload_bands(width: int, height: int) -> list[pygame.Rect]:
+    """One horizontal slice of a pending map upload, then the beam frame stays small."""
+    global _upload_y
+    if _upload_y is None or width <= 0 or height <= 0 or _upload_y >= height:
+        if _upload_y is not None and _upload_y >= height:
+            _upload_y = None
+        return []
+    band = max(40, height // 6)
+    rect = pygame.Rect(0, _upload_y, width, min(band, height - _upload_y))
+    _upload_y = rect.bottom
+    if _upload_y >= height:
+        _upload_y = None
+    return [rect]
+
+
+def _map_display_point(lx: float, ly: float, rotation: int, origin_off) -> tuple[int, int]:
+    """Logical pixel → display pixel, matching the live-icon centre mapping."""
+    side = theme.SIZE
+    x, y = int(round(lx)), int(round(ly))
+    if rotation == 0:
+        dx, dy = x, y
+    elif rotation == 90:
+        dx, dy = side - 1 - y, x
+    elif rotation == 180:
+        dx, dy = side - 1 - x, side - 1 - y
+    else:
+        dx, dy = y, side - 1 - x
+    return dx + int(origin_off[0]), dy + int(origin_off[1])
+
+
+def _rotated_sprite(sprite: pygame.Surface, rotation: int) -> pygame.Surface:
+    """Rotate ``sprite`` once and keep the result while that surface is alive."""
+    if rotation == 0:
+        return sprite
+    bucket = _rot_sprite_cache.get(sprite)
+    if bucket is not None:
+        hit = bucket.get(rotation)
+        if hit is not None:
+            return hit
+    else:
+        bucket = {}
+        _rot_sprite_cache[sprite] = bucket
+    img = pygame.transform.rotate(sprite, -rotation)
+    bucket[rotation] = img
+    return img
+
+
+def _blit_live_connectors(display, origin_off, rotation: int, connectors) -> list:
+    """Draw translucent trail tips in display space. Returns their dirty rects."""
+    rects: list = []
+    if not connectors:
+        return rects
+    for x0, y0, x1, y1, color, width in connectors:
+        p0 = _map_display_point(x0, y0, rotation, origin_off)
+        p1 = _map_display_point(x1, y1, rotation, origin_off)
+        rect = _alpha_line(display, p0, p1, color, width)
+        if rect is not None:
+            rects.append(rect)
+    return rects
+
+
+def _alpha_line(display, p0, p1, color, width: int):
+    """Blit one translucent line. The display itself has no per-pixel alpha."""
+    global _line_scratch
+    width = max(1, int(width))
+    pad = width + 2
+    left = int(math.floor(min(p0[0], p1[0]))) - pad
+    right = int(math.ceil(max(p0[0], p1[0]))) + pad
+    top = int(math.floor(min(p0[1], p1[1]))) - pad
+    bottom = int(math.ceil(max(p0[1], p1[1]))) + pad
+    rect = pygame.Rect(left, top, right - left + 1, bottom - top + 1)
+    rect = rect.clip(display.get_rect())
+    if rect.w <= 0 or rect.h <= 0:
+        return None
+    if (
+        _line_scratch is None
+        or _line_scratch.get_width() < rect.w
+        or _line_scratch.get_height() < rect.h
+    ):
+        _line_scratch = pygame.Surface((max(rect.w, 8), max(rect.h, 8)), pygame.SRCALPHA)
+    area = pygame.Rect(0, 0, rect.w, rect.h)
+    _line_scratch.fill((0, 0, 0, 0), area)
+    pygame.draw.line(
+        _line_scratch,
+        color,
+        (p0[0] - rect.x, p0[1] - rect.y),
+        (p1[0] - rect.x, p1[1] - rect.y),
+        width,
+    )
+    display.blit(_line_scratch, rect.topleft, area)
+    return rect
+
+
+def _blit_live_icons(display, origin_off, rotation: int, icons) -> list:
+    """Stamp live aircraft icons (logical coords) onto the display; return rects."""
+    rects: list = []
+    if not icons:
+        return rects
+    for sprite, lx, ly in icons:
+        dx, dy = _map_display_point(lx, ly, rotation, (0, 0))
+        img = _rotated_sprite(sprite, rotation)
+        rect = img.get_rect(center=(dx + origin_off[0], dy + origin_off[1]))
+        display.blit(img, rect)
+        rects.append(rect)
+    return rects
 
 
 def _rotate_rect_aabb(

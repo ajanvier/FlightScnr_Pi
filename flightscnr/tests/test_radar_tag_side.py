@@ -217,6 +217,17 @@ class TestTagQuadrants(unittest.TestCase):
         self.assertIsNotNone(geo_pts["stem"])
 
 
+class TestHudTapRemembersOff(unittest.TestCase):
+    def test_toggle_returns_to_off(self):
+        from display.round_touch import settings, tag_button
+
+        state = {"traffic_labels": "off", "show_aircraft_tag": False}
+        with mock.patch.object(settings, "_state", state), mock.patch.object(settings, "_save"):
+            self.assertEqual(tag_button.toggle(), "tap")
+            self.assertEqual(state.get("labels_full_mode"), "off")
+            self.assertEqual(tag_button.toggle(), "off")
+
+
 class TestTagLeadersFollowLabels(unittest.TestCase):
     def test_leaders_off_when_traffic_labels_off(self):
         from display.round_touch import settings
